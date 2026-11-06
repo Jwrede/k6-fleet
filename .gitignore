@@ -1,0 +1,3 @@
+/k6-fleet
+*.html
+!examples/**/*.html
