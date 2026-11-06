@@ -11,7 +11,7 @@ import (
 func TestRunArgsLeaveThresholdsToController(t *testing.T) {
 	args := runArgs(&proto.PrepareBody{Segment: "1/3:2/3", Sequence: "0,1/3,2/3,1", Instance: 1, Out: []string{"influxdb=http://i"}}, 6565, "/f", "/a.tar")
 	s := strings.Join(args, " ")
-	for _, want := range []string{"--paused", "--linger", "--no-setup", "--no-teardown", "--no-thresholds", "--no-summary",
+	for _, want := range []string{"--paused", "--linger", "--no-setup", "--no-teardown", "--no-thresholds", "--summary-mode=disabled",
 		"--execution-segment 1/3:2/3", "--execution-segment-sequence 0,1/3,2/3,1", "--out json=/f", "--out influxdb=http://i", "--tag instance_id=1"} {
 		if !strings.Contains(s, want) {
 			t.Errorf("missing %q in %s", want, s)

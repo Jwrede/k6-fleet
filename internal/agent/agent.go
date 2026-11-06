@@ -33,6 +33,10 @@ const (
 	statusEnded           = 9
 )
 
+// CodeUnknown in an Ended message means that k6 did not end cleanly and its exit
+// code follows in the Exit message.
+const CodeUnknown = -1
+
 // logLimit caps forwarded k6 output, so a script logging per iteration cannot
 // flood the control channel.
 const logLimit = 200
@@ -178,7 +182,7 @@ func (a *agent) prepare(p *proto.PrepareBody) error {
 		<-logsDone // cmd.Wait closes the pipe, so read it to the end first
 		err := cmd.Wait()
 		a.mu.Lock()
-		if !a.ended {
+		if !a.ended || a.code == CodeUnknown {
 			a.code = exitCode(err)
 		}
 		a.mu.Unlock()
@@ -190,12 +194,13 @@ func (a *agent) prepare(p *proto.PrepareBody) error {
 	return nil
 }
 
-// runArgs builds the k6 command line. --no-thresholds and --no-summary leave
-// both jobs to the controller, which is the only place with all samples.
+// runArgs builds the k6 command line. --no-thresholds and disabling the summary
+// leave both jobs to the controller, the only place with all samples. k6 2.x
+// removed --no-summary; --summary-mode works on 1.x and 2.x.
 func runArgs(p *proto.PrepareBody, port int, fifo, archive string) []string {
 	args := []string{"run",
 		"--paused", "--linger", "--no-setup", "--no-teardown",
-		"--no-summary", "--no-thresholds", "--no-usage-report", "--quiet",
+		"--summary-mode=disabled", "--no-thresholds", "--no-usage-report", "--quiet",
 		"--address", "127.0.0.1:" + strconv.Itoa(port),
 		"--execution-segment", p.Segment,
 		"--execution-segment-sequence", p.Sequence,
@@ -315,8 +320,13 @@ func (a *agent) pollStatus() {
 		}
 		if at.Status >= statusEnded {
 			a.mu.Lock()
-			if at.ExecutionResult != nil {
+			switch {
+			case at.ExecutionResult != nil:
 				a.code = at.ExecutionResult.ExitCode
+			case at.Status != statusEnded:
+				// k6 1.x has no execution_result. It was interrupted, and the
+				// code only becomes known when the lingering process exits.
+				a.code = CodeUnknown
 			}
 			a.mu.Unlock()
 			a.markEnded("")

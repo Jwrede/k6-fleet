@@ -77,6 +77,7 @@ type agentState struct {
 	endedAt  time.Time
 	exited   bool
 	lost     bool
+	stopSent bool // ended because the controller said so, so its code means nothing
 	code     int
 
 	cpuSum, cpuMax float64
@@ -171,7 +172,7 @@ func (c *ctl) run() (int, error) {
 	defer os.RemoveAll(tmp)
 	archive, info, err := c.buildArchive(tmp)
 	if err != nil {
-		return ExitError, err
+		return c.failure(err)
 	}
 	if c.ts, err = threshold.FromOptions(info.Thresholds); err != nil {
 		return ExitError, err
@@ -250,6 +251,10 @@ func (c *ctl) buildArchive(dir string) ([]byte, *inspectInfo, error) {
 	args := append([]string{"archive", "-O", path}, c.o.K6Args...)
 	args = append(args, c.o.Script)
 	if out, err := exec.CommandContext(c.ctx, c.o.K6, args...).CombinedOutput(); err != nil {
+		var ee *exec.ExitError
+		if errors.As(err, &ee) {
+			c.fatalCode = ee.ExitCode() // a script error stays exit 107, as in k6 run
+		}
 		return nil, nil, fmt.Errorf("k6 archive: %w\n%s", err, out)
 	}
 	out, err := exec.CommandContext(c.ctx, c.o.K6, "inspect", "--execution-requirements", path).Output()
@@ -440,6 +445,7 @@ func (c *ctl) abort(reason string, code int) {
 	c.logf("stopping all agents: %s", reason)
 	for _, a := range c.agents {
 		if !a.ended {
+			a.stopSent = true
 			c.send(a, proto.Msg{Type: proto.Stop})
 		}
 	}
@@ -512,12 +518,13 @@ func (c *ctl) apply(ev event) {
 			c.fatal = fmt.Errorf("k6 on %s exited with code %d before the test started:\n%s", a.spec.Name, m.Code, m.Text)
 		case m.Code != 0:
 			// exec.test.abort() or a crash ends one instance. A single k6 would stop
-			// altogether, so the rest of the fleet stops too.
-			c.abort(fmt.Sprintf("k6 on %s ended with code %d", a.spec.Name, m.Code), m.Code)
+			// altogether, so the rest of the fleet stops too. The exit code comes from
+			// the agents in finalise.
+			c.abort(fmt.Sprintf("k6 on %s did not end cleanly", a.spec.Name), 0)
 		}
 	case proto.Exit:
 		a.exited = true
-		if m.Code != 0 && a.code == 0 {
+		if m.Code != 0 && a.code <= 0 {
 			a.code = m.Code
 		}
 	}
@@ -704,7 +711,7 @@ func (c *ctl) finalise() (int, error) {
 		code = c.abortCode
 	default:
 		for _, a := range c.agents {
-			if a.code != 0 {
+			if a.code != 0 && !a.stopSent {
 				code = a.code
 				break
 			}

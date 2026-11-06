@@ -35,8 +35,12 @@ type Config struct {
 	CrashEarly    *int           `json:"crashEarly"` // exits during init
 	KillAgent     *int           `json:"killAgent"`  // kills the agent mid-run
 	ExitCode      map[string]int `json:"exitCode"`   // instance -> k6 exit code
-	EventLog      string         `json:"eventLog"`
-	SetupData     any            `json:"setupData"`
+	// LegacyAbort makes the instance behave like k6 1.x after exec.test.abort():
+	// status Interrupted, no execution_result, real code at process exit.
+	LegacyAbort   *int   `json:"legacyAbort"`
+	ShortInstance *int   `json:"shortInstance"` // ends after 10 iterations
+	EventLog      string `json:"eventLog"`
+	SetupData     any    `json:"setupData"`
 }
 
 type state struct {
@@ -191,11 +195,18 @@ func run(args []string) {
 	s.mu.Lock()
 	s.status = 7
 	s.mu.Unlock()
-	s.iterate(w, share(cfg.Iterations, segment))
+	n := share(cfg.Iterations, segment)
+	if cfg.ShortInstance != nil && *cfg.ShortInstance == instance {
+		n = 10
+	}
+	s.iterate(w, n)
 	code := cfg.ExitCode[strconv.Itoa(instance)]
 	s.mu.Lock()
 	s.status = 9
 	s.code = &code
+	if cfg.LegacyAbort != nil && *cfg.LegacyAbort == instance {
+		s.status, s.code, code = 10, nil, 108
+	}
 	s.mu.Unlock()
 	s.event("ended code=%d", code)
 	<-interrupted // --linger

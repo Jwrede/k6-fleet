@@ -307,6 +307,17 @@ func TestAgentExitCodePassesThrough(t *testing.T) {
 	}
 }
 
+func TestLegacyAbortWithoutExecutionResult(t *testing.T) {
+	two := 2
+	r := runFake(t, cfg{"iterations": 3000, "paceMs": 10, "exitCode": map[string]int{}, "legacyAbort": &two, "shortInstance": 2}, 3, nil)
+	if r.code != 108 {
+		t.Fatalf("code %d\n%s\n%s", r.code, r.out, r.stderr)
+	}
+	if got := r.sum.Metrics["iterations"].Values["count"]; got >= 3000 {
+		t.Errorf("the other agents must be stopped, got %v iterations", got)
+	}
+}
+
 func TestVersionMismatchIsRefused(t *testing.T) {
 	dir := t.TempDir()
 	wrap := filepath.Join(dir, "k6-old")
