@@ -33,9 +33,6 @@ const (
 	statusEnded           = 9
 )
 
-// fSetPipeSize is F_SETPIPE_SZ, which package syscall does not define.
-const fSetPipeSize = 1031
-
 // CodeUnknown in an Ended message means that k6 did not end cleanly and its exit
 // code follows in the Exit message.
 const CodeUnknown = -1
@@ -160,9 +157,7 @@ func (a *agent) prepare(p *proto.PrepareBody) error {
 	args := runArgs(p, port, a.fifo, archive)
 	cmd := exec.Command(p.K6, args...)
 	cmd.Dir = dir
-	// k6 must not outlive the agent: with --linger it would otherwise stay, and
-	// during a test keep producing load that nobody observes.
-	cmd.SysProcAttr = &syscall.SysProcAttr{Pdeathsig: syscall.SIGKILL}
+	bindToAgent(cmd)
 	pipe, err := cmd.StdoutPipe()
 	if err != nil {
 		return err
@@ -243,9 +238,7 @@ func (a *agent) readSamples() {
 		return
 	}
 	defer f.Close()
-	// The default 64 KiB pipe makes k6 and the agent take turns every few hundred
-	// samples. Failure only costs throughput, so the result is ignored.
-	_, _, _ = syscall.Syscall(syscall.SYS_FCNTL, f.Fd(), fSetPipeSize, 1<<20)
+	growPipe(f)
 	drain(f, func(lines [][]byte) {
 		a.mu.Lock()
 		defer a.mu.Unlock()

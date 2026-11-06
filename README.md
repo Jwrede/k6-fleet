@@ -17,7 +17,7 @@ The options today are these:
 | Option | Needs | Thresholds on merged data |
 |---|---|---|
 | [k6-operator](https://github.com/grafana/k6-operator) | Kubernetes | A code search finds threshold handling only in its Grafana Cloud path (`pkg/cloud`) |
-| Grafana Cloud k6 | Paid service | Yes |
+| Grafana Cloud k6 | Hosted service | Yes |
 | [orderly-ape](https://github.com/ReviewSignal/orderly-ape) | Several Kubernetes clusters and a web app | Results go to InfluxDB and Grafana |
 | [distributed-load-testing-on-aws](https://github.com/aws-solutions/distributed-load-testing-on-aws) | An AWS deployment | Own reporting |
 | Starting k6 by hand with `--execution-segment` | Own scripts for start, setup and aggregation | No |
@@ -149,7 +149,7 @@ Output from CI, real k6 v2.3.0, three agents, `e2e/scripts/shared.js`. The scrip
 - `handleSummary()` is not called, and `--summary-export` writes the k6-fleet JSON format, whose `metrics` section has the shape of the `handleSummary` data.
 - Percentiles have a relative error of at most 0.5 percent, so a threshold within that distance of its limit can go either way. Counts, rates, min, max and avg are exact.
 - A custom Gauge has no meaningful sum, so the newest sample across agents counts, compared by agent clocks. `vus` and `vus_max` are summed.
-- k6 metrics pass through the agent's FIFO, so the agent is Linux-only. The controller also runs on macOS only as far as `go build` allows, which is untested.
+- Agents were only tested on Linux. The macOS build compiles in CI and has not been run; without Linux's parent-death signal, k6 can outlive a killed agent there.
 - Environment variables such as `K6_*` are not forwarded to agents. Use `-e` and options after `--`, which end up in the archive.
 - The start is synchronised to the measured clock offset. Its precision depends on the round trip of the control connection.
 

@@ -19,6 +19,7 @@ jobs:
           go-version: ${{ matrix.go }}
       - run: test -z "$(gofmt -l .)"
       - run: go vet ./...
+      - run: GOOS=darwin GOARCH=arm64 go build -o /dev/null ./cmd/k6-fleet
       - run: go test -race ./...
 
   e2e:
