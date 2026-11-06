@@ -1,0 +1,7 @@
+{
+  "agents": [
+    { "name": "lg1", "transport": "ssh", "host": "ubuntu@10.0.0.11", "weight": 2 },
+    { "name": "lg2", "transport": "ssh", "host": "ubuntu@10.0.0.12", "ssh_args": ["-i", "/home/me/.ssh/loadtest"] },
+    { "name": "box", "transport": "docker", "image": "grafana/k6:2.3.0", "network": "host" }
+  ]
+}
