@@ -461,44 +461,57 @@ func TestKilledAgentAbortsAndTakesK6Along(t *testing.T) {
 	}
 }
 
-// Logs what the sample pipeline costs. There is no assertion, because shared CI
-// runners are too noisy for one; the README quotes the logged numbers.
+// Logs what the sample pipeline costs and where. There is no assertion, because
+// shared CI runners are too noisy for one; the README quotes the logged numbers.
 func TestOverheadAgainstPlainK6(t *testing.T) {
 	tg := newTarget(t)
 	dir := t.TempDir()
 	script := filepath.Join(dir, "load.js")
-	src := "import http from 'k6/http';\nexport const options = { vus: 20, duration: '15s' };\nexport default function () { http.get(__ENV.BASE + '/ok'); }\n"
+	src := "import http from 'k6/http';\nexport const options = { vus: 20, duration: '10s' };\nexport default function () { http.get(__ENV.BASE + '/ok'); }\n"
 	if err := os.WriteFile(script, []byte(src), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	exp := filepath.Join(dir, "plain.json")
-	if out, err := exec.Command("k6", "run", "--quiet", "--no-usage-report", "--summary-export", exp, "-e", "BASE="+tg.url, script).CombinedOutput(); err != nil {
-		t.Fatalf("%v\n%s", err, out)
+	plain := func(label string, extra ...string) {
+		exp := filepath.Join(dir, "plain.json")
+		args := append([]string{"run", "--quiet", "--no-usage-report", "--summary-export", exp, "-e", "BASE=" + tg.url}, extra...)
+		if out, err := exec.Command("k6", append(args, script)...).CombinedOutput(); err != nil {
+			t.Fatalf("%s: %v\n%s", label, err, out)
+		}
+		var r struct {
+			Metrics map[string]map[string]any `json:"metrics"`
+		}
+		b, err := os.ReadFile(exp)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := json.Unmarshal(b, &r); err != nil {
+			t.Fatal(err)
+		}
+		t.Logf("OVERHEAD %-34s reqs/s=%.0f", label, r.Metrics["http_reqs"]["rate"])
 	}
-	var plain struct {
-		Metrics map[string]map[string]any `json:"metrics"`
+	fleetRun := func(label string, extra ...string) {
+		sum := filepath.Join(dir, "fleet.json")
+		args := append([]string{"run", "--local", "1", "--quiet", "--summary-export", sum, script, "--", "-e", "BASE=" + tg.url}, extra...)
+		if out, err := exec.Command(fleetBin, args...).CombinedOutput(); err != nil {
+			t.Fatalf("%s: %v\n%s", label, err, out)
+		}
+		var s summary
+		b, err := os.ReadFile(sum)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := json.Unmarshal(b, &s); err != nil {
+			t.Fatal(err)
+		}
+		t.Logf("OVERHEAD %-34s reqs/s=%.0f", label, s.Metrics["http_reqs"].Values["rate"])
 	}
-	b, err := os.ReadFile(exp)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := json.Unmarshal(b, &plain); err != nil {
-		t.Fatal(err)
-	}
-	sum := filepath.Join(dir, "fleet.json")
-	cmd := exec.Command(fleetBin, "run", "--local", "1", "--quiet", "--summary-export", sum, script, "--", "-e", "BASE="+tg.url)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("%v\n%s", err, out)
-	}
-	var s summary
-	b, err = os.ReadFile(sum)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := json.Unmarshal(b, &s); err != nil {
-		t.Fatal(err)
-	}
-	t.Logf("OVERHEAD plain k6 reqs/s=%v, k6-fleet one agent reqs/s=%v", plain.Metrics["http_reqs"]["rate"], s.Metrics["http_reqs"].Values["rate"])
+	tags := "--system-tags=status,name,check,group,scenario"
+	plain("plain k6")
+	plain("k6 --out json=/dev/null", "--out", "json=/dev/null")
+	plain("k6 --out json + few system tags", "--out", "json=/dev/null", tags)
+	plain("k6 --out csv=/dev/null", "--out", "csv=/dev/null")
+	fleetRun("k6-fleet, one agent")
+	fleetRun("k6-fleet, one agent, few tags", tags)
 }
 
 func inventory(t *testing.T, v any) string {
