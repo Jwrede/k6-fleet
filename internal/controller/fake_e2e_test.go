@@ -302,7 +302,7 @@ func TestAgentExitCodePassesThrough(t *testing.T) {
 	if r.code != 108 {
 		t.Fatalf("code %d", r.code)
 	}
-	if !strings.Contains(r.sum.Aborted, "code 108") {
+	if !strings.Contains(r.sum.Aborted, "did not end cleanly") {
 		t.Errorf("aborted %q", r.sum.Aborted)
 	}
 }
