@@ -33,6 +33,9 @@ const (
 	statusEnded           = 9
 )
 
+// fSetPipeSize is F_SETPIPE_SZ, which package syscall does not define.
+const fSetPipeSize = 1031
+
 // CodeUnknown in an Ended message means that k6 did not end cleanly and its exit
 // code follows in the Exit message.
 const CodeUnknown = -1
@@ -240,14 +243,51 @@ func (a *agent) readSamples() {
 		return
 	}
 	defer f.Close()
-	r := bufio.NewReaderSize(f, 1<<20)
-	for {
-		line, err := r.ReadBytes('\n')
-		if len(line) > 1 {
-			a.mu.Lock()
-			a.aggr.Feed(bytes.TrimRight(line, "\n"))
-			a.mu.Unlock()
+	// The default 64 KiB pipe makes k6 and the agent take turns every few hundred
+	// samples. Failure only costs throughput, so the result is ignored.
+	_, _, _ = syscall.Syscall(syscall.SYS_FCNTL, f.Fd(), fSetPipeSize, 1<<20)
+	drain(f, func(lines [][]byte) {
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		for _, l := range lines {
+			a.aggr.Feed(l)
 		}
+	})
+}
+
+// drain reads r in large blocks and hands over complete lines. Taking the lock
+// per block and not copying each line keeps the agent's share of the CPU small,
+// and that CPU is taken from k6 on the same machine.
+func drain(r io.Reader, feed func([][]byte)) {
+	buf := make([]byte, 1<<20)
+	have := 0
+	var lines [][]byte
+	for {
+		if have == len(buf) { // one line longer than the buffer
+			buf = append(buf, make([]byte, len(buf))...)
+		}
+		n, err := r.Read(buf[have:])
+		data := buf[:have+n]
+		lines = lines[:0]
+		rest := data
+		for {
+			i := bytes.IndexByte(rest, '\n')
+			if i < 0 {
+				break
+			}
+			if i > 0 {
+				lines = append(lines, rest[:i])
+			}
+			rest = rest[i+1:]
+		}
+		if err != nil && len(rest) > 0 {
+			lines = append(lines, rest)
+			rest = nil
+		}
+		if len(lines) > 0 {
+			feed(lines)
+		}
+		have = copy(buf, rest)
 		if err != nil {
 			return
 		}

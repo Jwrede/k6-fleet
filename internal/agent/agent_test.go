@@ -1,9 +1,11 @@
 package agent
 
 import (
+	"io"
 	"reflect"
 	"strings"
 	"testing"
+	"testing/iotest"
 
 	"github.com/Jwrede/k6-fleet/internal/proto"
 )
@@ -19,6 +21,26 @@ func TestRunArgsLeaveThresholdsToController(t *testing.T) {
 	}
 	if args[len(args)-1] != "/a.tar" {
 		t.Error("archive must be last")
+	}
+}
+
+func TestDrainReassemblesLines(t *testing.T) {
+	long := strings.Repeat("x", 3<<20) // longer than the initial buffer
+	input := "a\n\nbb\n" + long + "\nno newline at end"
+	for name, r := range map[string]io.Reader{
+		"block":   strings.NewReader(input),
+		"onebyte": iotest.HalfReader(strings.NewReader(input)),
+	} {
+		var got []string
+		drain(r, func(lines [][]byte) {
+			for _, l := range lines {
+				got = append(got, string(l))
+			}
+		})
+		want := []string{"a", "bb", long, "no newline at end"}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("%s: %d lines", name, len(got))
+		}
 	}
 }
 
