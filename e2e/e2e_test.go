@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math"
 	"net"
 	"net/http"
@@ -343,6 +344,161 @@ func TestBrokenScript(t *testing.T) {
 	if code == 0 || !strings.Contains(out, "fails at init") {
 		t.Fatalf("exit %d\n%s", code, out)
 	}
+}
+
+func TestCLIOptionsReachTheAgents(t *testing.T) {
+	tg := newTarget(t)
+	dir := t.TempDir()
+	script := filepath.Join(dir, "plain.js")
+	src := "import http from 'k6/http';\nexport default function () { http.get(__ENV.BASE + '/ok'); }\n"
+	if err := os.WriteFile(script, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sum := filepath.Join(dir, "s.json")
+	cmd := exec.Command(fleetBin, "run", "--local", "3", "--summary-export", sum, script,
+		"--", "--vus", "6", "--iterations", "300", "-e", "BASE="+tg.url)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("%v\n%s", err, out)
+	}
+	if tg.requests != 300 {
+		t.Errorf("target saw %d, want 300", tg.requests)
+	}
+}
+
+func TestReportAndLiveMetrics(t *testing.T) {
+	tg := newTarget(t)
+	dir := t.TempDir()
+	html := filepath.Join(dir, "report.html")
+	if keep := os.Getenv("K6FLEET_E2E_REPORT"); keep != "" {
+		html = keep
+	}
+	port := freePort(t)
+	var body string
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		time.Sleep(4 * time.Second)
+		resp, err := http.Get("http://127.0.0.1:" + port + "/metrics")
+		if err != nil {
+			return
+		}
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(resp.Body)
+		body = string(b)
+	}()
+	code, s, out := fleet(t, tg, "ramp.js", "--local", "3", "--report", html, "--listen", "127.0.0.1:"+port)
+	<-done
+	if code != 0 {
+		t.Fatalf("exit %d\n%s", code, out)
+	}
+	if !strings.Contains(body, `k6_fleet_metric{name="http_reqs",stat="count"}`) {
+		t.Errorf("no live metrics during the run:\n%s", body)
+	}
+	page, err := os.ReadFile(html)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(page), "<polyline") {
+		t.Error("report has no chart")
+	}
+	if s.Metrics["http_reqs"].Values["count"] == 0 {
+		t.Error("empty summary")
+	}
+}
+
+func freePort(t *testing.T) string {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	return strconv.Itoa(l.Addr().(*net.TCPAddr).Port)
+}
+
+// A killed agent must end the run with exit 3, and its k6 must not keep sending
+// load. --on-agent-loss=abort is the default.
+func TestKilledAgentAbortsAndTakesK6Along(t *testing.T) {
+	tg := newTarget(t)
+	dir := t.TempDir()
+	sum := filepath.Join(dir, "s.json")
+	cmd := exec.Command(fleetBin, "run", "--local", "3", "--summary-export", sum, "scripts/ramp.js", "--", "-e", "BASE="+tg.url, "--stage", "60s:3")
+	var out bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &out, &out
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(5 * time.Second)
+	pids, err := exec.Command("pgrep", "-P", strconv.Itoa(cmd.Process.Pid)).Output()
+	if err != nil {
+		t.Fatalf("no agents: %v\n%s", err, out.String())
+	}
+	agents := strings.Fields(string(pids))
+	if len(agents) != 3 {
+		t.Fatalf("agents %v", agents)
+	}
+	k6pids, _ := exec.Command("pgrep", "-P", agents[1]).Output()
+	k6pid := strings.TrimSpace(string(k6pids))
+	if k6pid == "" {
+		t.Fatal("agent has no k6 child")
+	}
+	if err := exec.Command("kill", "-9", agents[1]).Run(); err != nil {
+		t.Fatal(err)
+	}
+	waited := make(chan error, 1)
+	go func() { waited <- cmd.Wait() }()
+	select {
+	case <-waited:
+	case <-time.After(40 * time.Second):
+		_ = cmd.Process.Kill()
+		t.Fatalf("run did not stop:\n%s", out.String())
+	}
+	if c := cmd.ProcessState.ExitCode(); c != 3 {
+		t.Errorf("exit %d\n%s", c, out.String())
+	}
+	if _, err := os.Stat("/proc/" + k6pid); err == nil {
+		t.Errorf("k6 %s outlived its agent", k6pid)
+	}
+}
+
+// Logs what the sample pipeline costs. There is no assertion, because shared CI
+// runners are too noisy for one; the README quotes the logged numbers.
+func TestOverheadAgainstPlainK6(t *testing.T) {
+	tg := newTarget(t)
+	dir := t.TempDir()
+	script := filepath.Join(dir, "load.js")
+	src := "import http from 'k6/http';\nexport const options = { vus: 20, duration: '15s' };\nexport default function () { http.get(__ENV.BASE + '/ok'); }\n"
+	if err := os.WriteFile(script, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	exp := filepath.Join(dir, "plain.json")
+	if out, err := exec.Command("k6", "run", "--quiet", "--no-usage-report", "--summary-export", exp, "-e", "BASE="+tg.url, script).CombinedOutput(); err != nil {
+		t.Fatalf("%v\n%s", err, out)
+	}
+	var plain struct {
+		Metrics map[string]map[string]any `json:"metrics"`
+	}
+	b, err := os.ReadFile(exp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(b, &plain); err != nil {
+		t.Fatal(err)
+	}
+	sum := filepath.Join(dir, "fleet.json")
+	cmd := exec.Command(fleetBin, "run", "--local", "1", "--quiet", "--summary-export", sum, script, "--", "-e", "BASE="+tg.url)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("%v\n%s", err, out)
+	}
+	var s summary
+	b, err = os.ReadFile(sum)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(b, &s); err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("OVERHEAD plain k6 reqs/s=%v, k6-fleet one agent reqs/s=%v", plain.Metrics["http_reqs"]["rate"], s.Metrics["http_reqs"].Values["rate"])
 }
 
 func inventory(t *testing.T, v any) string {

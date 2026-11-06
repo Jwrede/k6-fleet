@@ -3,6 +3,10 @@ import http from 'k6/http';
 import { check, group } from 'k6';
 import exec from 'k6/execution';
 import { Trend } from 'k6/metrics';
+import { hitPath } from './lib/path.js';
+
+// A relative import and open() have to survive the trip through the archive.
+const expected = JSON.parse(open('./data/expected.json')).expected;
 
 const deterministic = new Trend('deterministic');
 
@@ -24,10 +28,10 @@ export function setup() {
 export default function (data) {
   const i = exec.scenario.iterationInTest;
   deterministic.add(i);
-  const r = http.get(`${__ENV.BASE}/hit?i=${i}&token=${data.token}`, { tags: { name: 'hit' } });
+  const r = http.get(`${__ENV.BASE}${hitPath(i, data.token)}`, { tags: { name: 'hit' } });
   check(r, { 'status is 200': (x) => x.status === 200 });
   group('g', () => {
-    check(r, { 'body is ok': (x) => x.body === 'ok' });
+    check(r, { 'body is ok': (x) => x.body === expected });
   });
 }
 
