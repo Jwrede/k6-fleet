@@ -24,6 +24,7 @@ const (
 	Teardown = "teardown"
 	Stop     = "stop"
 	Finish   = "finish"
+	SetVUs   = "set_vus"
 
 	// Agent to controller.
 	Hello        = "hello"
@@ -59,6 +60,8 @@ type PrepareBody struct {
 	K6       string     `json:"k6"`
 	Out      []string   `json:"out,omitempty"`
 	Specs    []agg.Spec `json:"specs,omitempty"`
+	// PerRequest asks for statistics per request name, which the web page shows.
+	PerRequest bool `json:"per_request,omitempty"`
 }
 
 // Msg is one protocol message. Unused fields stay empty.
@@ -72,6 +75,8 @@ type Msg struct {
 	Echo    int64           `json:"echo,omitempty"` // pong: the ping's T
 	Code    int             `json:"code,omitempty"` // k6 exit code
 	Text    string          `json:"text,omitempty"`
+	VUs     int64           `json:"vus,omitempty"`     // SetVUs: test total, k6 applies the segment
+	MaxVUs  int64           `json:"max_vus,omitempty"` // SetVUs
 }
 
 // Writer serialises messages from several goroutines.

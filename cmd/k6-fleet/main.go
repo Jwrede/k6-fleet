@@ -19,7 +19,7 @@ import (
 	"github.com/Jwrede/k6-fleet/internal/transport"
 )
 
-var version = "0.1.0"
+var version = "0.2.0"
 
 const usage = `k6-fleet runs one k6 test across several machines.
 
@@ -74,6 +74,8 @@ func run(args []string) int {
 	fs.StringVar(&o.Summary, "summary-export", "", "write the merged summary as JSON")
 	fs.StringVar(&o.HTML, "report", "", "write a self-contained HTML report")
 	fs.StringVar(&o.Listen, "listen", "", "serve live merged metrics at this address under /metrics")
+	fs.StringVar(&o.Web, "web", "", "serve the web page at this address, a bare :port means localhost")
+	fs.BoolVar(&o.Autostart, "autostart", false, "with --web: run once without waiting for the page and exit afterwards")
 	fs.StringVar(&o.OnLoss, "on-agent-loss", "abort", "abort or continue when an agent disappears")
 	fs.DurationVar(&o.Ready, "ready-timeout", 2*time.Minute, "how long agents may take to initialise")
 	fs.DurationVar(&o.MaxRun, "max-duration", 0, "stop the test after this long (default: script duration + 2m)")
@@ -93,6 +95,11 @@ func run(args []string) int {
 		fmt.Fprintln(os.Stderr, "--on-agent-loss must be abort or continue")
 		return 2
 	}
+	if o.Autostart && o.Web == "" {
+		fmt.Fprintln(os.Stderr, "--autostart needs --web")
+		return 2
+	}
+	o.WebToken = os.Getenv("K6FLEET_WEB_TOKEN")
 	agents, err := loadAgents(*inventory, *local, *ssh, o.K6)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)

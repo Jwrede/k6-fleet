@@ -8,8 +8,11 @@
 package main
 
 import (
+	"archive/tar"
 	"bufio"
+	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math/big"
@@ -41,6 +44,21 @@ type Config struct {
 	ShortInstance *int   `json:"shortInstance"` // ends after 10 iterations
 	EventLog      string `json:"eventLog"`
 	SetupData     any    `json:"setupData"`
+	// Names cycle through the request names, default "/hit". Logs are written to
+	// stderr at the start of the test, as k6 prints them when not on a terminal.
+	Names []string `json:"names"`
+	Logs  []string `json:"logs"`
+
+	// Filled from the archive's metadata.json.
+	Env      map[string]string `json:"-"`
+	Scenario *scenario         `json:"-"`
+}
+
+type scenario struct {
+	Executor string `json:"executor"`
+	VUs      int64  `json:"vus"`
+	MaxVUs   int64  `json:"maxVUs"`
+	Duration string `json:"duration"`
 }
 
 type state struct {
@@ -54,6 +72,8 @@ type state struct {
 	stop     chan struct{}
 	once     sync.Once
 	stopOnce sync.Once
+	segment  string
+	vus      int
 }
 
 func (s *state) event(format string, a ...any) {
@@ -83,7 +103,11 @@ func main() {
 		archive(os.Args[2:])
 	case "inspect":
 		cfg := load(os.Args[len(os.Args)-1])
-		out, _ := json.Marshal(map[string]any{"thresholds": cfg.Thresholds, "totalDuration": cfg.TotalDuration, "maxVUs": 1})
+		total := cfg.TotalDuration
+		if cfg.Scenario != nil {
+			total = cfg.Scenario.Duration
+		}
+		out, _ := json.Marshal(map[string]any{"thresholds": cfg.Thresholds, "totalDuration": total, "maxVUs": 1})
 		fmt.Println(string(out))
 	case "run":
 		run(os.Args[2:])
@@ -94,20 +118,37 @@ func main() {
 
 func archive(args []string) {
 	var dst, src string
+	env := map[string]string{}
 	for i := 0; i < len(args); i++ {
-		if args[i] == "-O" {
+		switch args[i] {
+		case "-O":
 			dst = args[i+1]
 			i++
-			continue
+		case "-e":
+			k, v, _ := strings.Cut(args[i+1], "=")
+			env[k] = v
+			i++
+		case "--vus", "--duration":
+			env[strings.TrimPrefix(args[i], "--")] = args[i+1]
+			i++
+		default:
+			src = args[i]
 		}
-		src = args[i]
 	}
 	data, err := os.ReadFile(src)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(107)
 	}
-	if err := os.WriteFile(dst, data, 0o644); err != nil {
+	meta, _ := json.Marshal(map[string]any{"filename": src, "options": map[string]any{"vus": 1}, "env": env})
+	var b bytes.Buffer
+	w := tar.NewWriter(&b)
+	for name, body := range map[string][]byte{"metadata.json": meta, "script.json": data} {
+		_ = w.WriteHeader(&tar.Header{Name: name, Mode: 0o644, Size: int64(len(body))})
+		_, _ = w.Write(body)
+	}
+	_ = w.Close()
+	if err := os.WriteFile(dst, b.Bytes(), 0o644); err != nil {
 		os.Exit(1)
 	}
 }
@@ -118,10 +159,37 @@ func load(path string) Config {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(107)
 	}
+	var meta struct {
+		Env     map[string]string `json:"env"`
+		Options struct {
+			Scenarios map[string]scenario `json:"scenarios"`
+		} `json:"options"`
+	}
+	r := tar.NewReader(bytes.NewReader(data))
+	for {
+		h, err := r.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			break // a plain script, not an archive
+		}
+		body, _ := io.ReadAll(r)
+		switch h.Name {
+		case "metadata.json":
+			_ = json.Unmarshal(body, &meta)
+		case "script.json":
+			data = body
+		}
+	}
 	var c Config
 	if err := json.Unmarshal(data, &c); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(107)
+	}
+	c.Env = meta.Env
+	if s, ok := meta.Options.Scenarios["fleet"]; ok {
+		c.Scenario = &s
 	}
 	return c
 }
@@ -157,8 +225,16 @@ func run(args []string) {
 		}
 	}
 	cfg := load(args[len(args)-1])
-	s := &state{status: 1, paused: true, cfg: cfg, instance: instance, start: make(chan struct{}), stop: make(chan struct{})}
+	s := &state{status: 1, paused: true, cfg: cfg, instance: instance, start: make(chan struct{}), stop: make(chan struct{}), segment: segment, vus: 2}
 	s.event("args %s", strings.Join(args, " "))
+	if len(cfg.Env) > 0 {
+		out, _ := json.Marshal(cfg.Env)
+		s.event("env %s", out)
+	}
+	if sc := cfg.Scenario; sc != nil {
+		s.vus = share(int(sc.VUs), segment)
+		s.event("scenario %s vus=%d max=%d duration=%s", sc.Executor, sc.VUs, sc.MaxVUs, sc.Duration)
+	}
 	if cfg.CrashEarly != nil && *cfg.CrashEarly == instance {
 		fmt.Fprintln(os.Stderr, "SyntaxError: fake script exception")
 		os.Exit(107)
@@ -195,6 +271,9 @@ func run(args []string) {
 	s.mu.Lock()
 	s.status = 7
 	s.mu.Unlock()
+	for _, l := range cfg.Logs {
+		fmt.Fprintln(os.Stderr, l)
+	}
 	n := share(cfg.Iterations, segment)
 	if cfg.ShortInstance != nil && *cfg.ShortInstance == instance {
 		n = 10
@@ -223,6 +302,13 @@ func (s *state) iterate(w *bufio.Writer, n int) {
 	}
 	failed := s.cfg.FailInstance != nil && *s.cfg.FailInstance == s.instance
 	ts := func() string { return time.Now().UTC().Format(time.RFC3339Nano) }
+	var deadline time.Time
+	if sc := s.cfg.Scenario; sc != nil {
+		n = 1 << 40
+		if d, _ := time.ParseDuration(sc.Duration); d > 0 {
+			deadline = time.Now().Add(d)
+		}
+	}
 	point := func(metric string, v float64, tags string) {
 		fmt.Fprintf(w, `{"metric":%q,"type":"Point","data":{"time":%q,"value":%v,"tags":{%s}}}`+"\n", metric, ts(), v, tags)
 	}
@@ -234,23 +320,33 @@ func (s *state) iterate(w *bufio.Writer, n int) {
 			return
 		default:
 		}
+		if !deadline.IsZero() && time.Now().After(deadline) {
+			break
+		}
 		if s.cfg.KillAgent != nil && *s.cfg.KillAgent == s.instance && i == n/2 {
 			w.Flush()
 			s.event("killing agent")
 			_ = syscall.Kill(os.Getppid(), syscall.SIGKILL)
 			time.Sleep(time.Hour)
 		}
-		status, bad := "200", 0.0
+		status, bad, expected, errTag := "200", 0.0, "true", ""
 		if failed {
-			status, bad = "500", 1
+			status, bad, expected, errTag = "500", 1, "false", `,"error":"Internal Server Error"`
 		}
-		tags := fmt.Sprintf(`"status":%q,"method":"GET","scenario":"default"`, status)
+		name := "/hit"
+		if len(s.cfg.Names) > 0 {
+			name = s.cfg.Names[i%len(s.cfg.Names)]
+		}
+		tags := fmt.Sprintf(`"status":%q,"method":"GET","scenario":"default","name":%q,"expected_response":%q%s`, status, name, expected, errTag)
 		point("http_req_duration", float64(lat)+float64(i%5), tags)
 		point("http_reqs", 1, tags)
 		point("http_req_failed", bad, tags)
 		point("checks", 1-bad, `"check":"status is 200","group":""`)
 		point("iterations", 1, `"scenario":"default"`)
-		point("vus", 2, "")
+		s.mu.Lock()
+		vus := s.vus
+		s.mu.Unlock()
+		point("vus", float64(vus), "")
 		if i%20 == 0 {
 			w.Flush()
 		}
@@ -271,6 +367,8 @@ func (s *state) routes() http.Handler {
 					Attributes struct {
 						Paused  *bool `json:"paused"`
 						Stopped bool  `json:"stopped"`
+						VUs     *int  `json:"vus"`
+						VUsMax  *int  `json:"vus-max"`
 					} `json:"attributes"`
 				} `json:"data"`
 			}
@@ -279,6 +377,16 @@ func (s *state) routes() http.Handler {
 			if p := env.Data.Attributes.Paused; p != nil && !*p {
 				s.event("resume")
 				s.once.Do(func() { close(s.start) })
+			}
+			if v := env.Data.Attributes.VUs; v != nil {
+				if s.cfg.Scenario == nil {
+					http.Error(w, "could not find an externally controlled executor", http.StatusBadRequest)
+					return
+				}
+				s.event("vus=%d max=%d", *v, *env.Data.Attributes.VUsMax)
+				s.mu.Lock()
+				s.vus = share(*v, s.segment)
+				s.mu.Unlock()
 			}
 			if env.Data.Attributes.Stopped {
 				s.event("stop")

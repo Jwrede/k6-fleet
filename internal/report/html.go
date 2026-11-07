@@ -3,6 +3,7 @@ package report
 import (
 	"fmt"
 	"html/template"
+	"io"
 	"os"
 	"sort"
 	"strings"
@@ -72,6 +73,10 @@ figure{margin:12px 0}figcaption{font-size:13px;color:var(--muted)}.w{overflow-x:
 {{range .Charts}}<figure>{{.SVG}}<figcaption>{{.Title}}, peak {{printf "%.4g" .Peak}}</figcaption></figure>{{end}}
 {{if .D.Checks}}<h2>Checks</h2><div class="w"><table><tr><th>Check</th><th class="n">Passed</th><th class="n">Failed</th></tr>
 {{range .D.Checks}}<tr><td>{{.Group}} {{.Name}}</td><td class="n">{{.Pass}}</td><td class="n">{{.Fail}}</td></tr>{{end}}</table></div>{{end}}
+{{if .D.Requests}}<h2>Requests</h2><div class="w"><table><tr><th>Method</th><th>Name</th><th class="n">Requests</th><th class="n">Fails</th><th class="n">Avg ms</th><th class="n">Med ms</th><th class="n">p(95) ms</th><th class="n">p(99) ms</th><th class="n">Max ms</th></tr>
+{{range .D.Requests}}<tr><td>{{.Method}}</td><td>{{.Name}}</td><td class="n">{{.Requests}}</td><td class="n">{{.Fails}}</td><td class="n">{{printf "%.1f" .Avg}}</td><td class="n">{{printf "%.1f" .Med}}</td><td class="n">{{printf "%.1f" .P95}}</td><td class="n">{{printf "%.1f" .P99}}</td><td class="n">{{printf "%.1f" .Max}}</td></tr>{{end}}</table></div>{{end}}
+{{if .D.Failures}}<h2>Failures</h2><div class="w"><table><tr><th class="n">Count</th><th>Method</th><th>Name</th><th>Status</th><th>Error</th></tr>
+{{range .D.Failures}}<tr><td class="n">{{.Count}}</td><td>{{.Method}}</td><td>{{.Name}}</td><td>{{.Status}}</td><td>{{.Error}}</td></tr>{{end}}</table></div>{{end}}
 <h2>Metrics</h2><div class="w"><table><tr><th>Metric</th><th>Value</th></tr>
 {{range .Rows}}<tr><td>{{.Name}}</td><td>{{.Text}}</td></tr>{{end}}</table></div>
 <h2>Agents</h2><div class="w"><table><tr><th>Name</th><th>Segment</th><th class="n">Iterations</th><th class="n">Requests</th><th class="n">CPU avg</th><th class="n">CPU max</th><th class="n">Exit</th></tr>
@@ -82,6 +87,16 @@ figure{margin:12px 0}figcaption{font-size:13px;color:var(--muted)}.w{overflow-x:
 
 // WriteHTML stores a self-contained report at path.
 func (d *Data) WriteHTML(path string) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return d.RenderHTML(f)
+}
+
+// RenderHTML writes the self-contained report.
+func (d *Data) RenderHTML(w io.Writer) error {
 	t, err := template.New("report").Parse(page)
 	if err != nil {
 		return err
@@ -115,12 +130,7 @@ func (d *Data) WriteHTML(path string) error {
 	for _, k := range names {
 		rows = append(rows, row{k, d.metricLine(k, d.Metrics[k])})
 	}
-	f, err := os.Create(path)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	return t.Execute(f, map[string]any{
+	return t.Execute(w, map[string]any{
 		"D": d, "Charts": charts, "Rows": rows,
 		"Seconds": fmt.Sprintf("%.1f", float64(d.DurationMs)/1000),
 		"ErrPct":  d.PercentileRelativeError * 100,

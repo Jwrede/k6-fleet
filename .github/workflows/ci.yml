@@ -49,16 +49,25 @@ jobs:
           chmod go-w ~
           ssh-keyscan -H localhost 127.0.0.1 >> ~/.ssh/known_hosts
           ssh -o BatchMode=yes localhost true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
       - name: Run against real k6
         env:
           K6FLEET_E2E: '1'
+          K6FLEET_E2E_CHROME: google-chrome
+          K6FLEET_E2E_SHOTS: ${{ runner.temp }}/shots
           K6FLEET_E2E_DOCKER_IMAGE: grafana/k6:${{ matrix.k6 == 'v2.3.0' && '2.3.0' || '1.8.2' }}
           K6FLEET_E2E_SSH: localhost,127.0.0.1
           K6FLEET_E2E_REPORT: ${{ runner.temp }}/report.html
-        run: go test -v -timeout 15m ./e2e/
+        run: |
+          mkdir -p "$K6FLEET_E2E_SHOTS"
+          go test -v -timeout 15m ./e2e/
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: report-${{ matrix.k6 }}
-          path: ${{ runner.temp }}/report.html
+          path: |
+            ${{ runner.temp }}/report.html
+            ${{ runner.temp }}/shots
           if-no-files-found: ignore

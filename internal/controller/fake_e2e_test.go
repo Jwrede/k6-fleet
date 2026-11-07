@@ -73,6 +73,13 @@ type cfg map[string]any
 
 func runFake(t *testing.T, c cfg, n int, tweak func(*Options)) result {
 	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	return runFakeCtx(t, ctx, c, n, tweak)
+}
+
+func runFakeCtx(t *testing.T, ctx context.Context, c cfg, n int, tweak func(*Options)) result {
+	t.Helper()
 	dir := t.TempDir()
 	t.Setenv("TMPDIR", t.TempDir()) // agents killed on purpose leave their work dir
 	log := filepath.Join(dir, "events.log")
@@ -99,8 +106,6 @@ func runFake(t *testing.T, c cfg, n int, tweak func(*Options)) result {
 	if tweak != nil {
 		tweak(&o)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
 	code, err := Run(ctx, o)
 	r := result{code: code, err: err, out: out.String(), stderr: errb.String()}
 	if b, e := os.ReadFile(sum); e == nil {
