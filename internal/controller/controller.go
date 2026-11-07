@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Jwrede/k6-fleet/internal/agg"
@@ -47,6 +48,9 @@ type Options struct {
 	Summary    string
 	HTML       string
 	Listen     string // Prometheus endpoint address
+	Web        string // web page address; the run waits for Start unless Autostart
+	WebToken   string // token for control actions; generated if the address needs one
+	Autostart  bool   // with Web: start at once and exit when the run ends
 	OnLoss     string // abort or continue
 	Ready      time.Duration
 	MaxRun     time.Duration // 0: derive from the script
@@ -55,6 +59,7 @@ type Options struct {
 	Stdout     io.Writer
 	Stderr     io.Writer
 	OnListen   func(addr string)
+	OnWeb      func(addr string)
 	StartDelay time.Duration
 }
 
@@ -85,6 +90,7 @@ type agentState struct {
 	lastCPU        float64
 	hotSeconds     int
 	maxLag         int64
+	lastLag        int64
 	iterations     float64
 	requests       float64
 }
@@ -93,6 +99,7 @@ type event struct {
 	a   *agentState
 	m   proto.Msg
 	err error
+	cmd *command // from the web page; a is nil
 }
 
 type ctl struct {
@@ -103,14 +110,22 @@ type ctl struct {
 	ts      []threshold.Threshold
 	started time.Time
 
-	mu     sync.Mutex // guards fleet and data for the /metrics handler
 	fleet  *agg.Fleet
 	tick   *agg.Fleet
 	second int
 	points []report.Point
 	k6     string
 	script string
+	total  string // planned duration from k6 inspect
 
+	phase    string
+	startNow bool
+	token    string
+	web      *http.Server
+	metrics  *http.Server
+	live     atomic.Pointer[liveState] // the only state HTTP handlers read
+
+	final      *report.Data
 	fatal      error
 	fatalCode  int
 	stopping   bool
@@ -145,6 +160,16 @@ func Run(ctx context.Context, o Options) (int, error) {
 	}
 	code, err := c.run()
 	c.closeAll()
+	c.publishEnd(code, err)
+	if c.web != nil && !o.Autostart {
+		c.logf("run ended with exit code %d; the page stays up until interrupted", code)
+		<-ctx.Done()
+	}
+	for _, s := range []*http.Server{c.web, c.metrics} {
+		if s != nil {
+			_ = s.Close()
+		}
+	}
 	return code, err
 }
 
@@ -170,10 +195,17 @@ func (c *ctl) run() (int, error) {
 		return ExitError, err
 	}
 	defer os.RemoveAll(tmp)
+	if c.o.Web != "" {
+		if err := c.serveWeb(); err != nil {
+			return ExitError, err
+		}
+	}
+	c.setPhase(phaseConnecting)
 	archive, info, err := c.buildArchive(tmp)
 	if err != nil {
 		return c.failure(err)
 	}
+	c.total = info.TotalDuration
 	if c.ts, err = threshold.FromOptions(info.Thresholds); err != nil {
 		return ExitError, err
 	}
@@ -213,9 +245,19 @@ func (c *ctl) run() (int, error) {
 			K6: k6, Out: c.o.AgentOut, Specs: specs,
 		}})
 	}
+	c.setPhase(phaseInitialising)
 	if err := c.pump("all k6 instances to initialise", c.o.Ready, func() bool { return c.all(func(a *agentState) bool { return a.ready }) }); err != nil {
 		return c.failure(err)
 	}
+	if c.web != nil && !c.o.Autostart {
+		// setup() can change the target, so it waits for the operator too.
+		c.setPhase(phaseReady)
+		c.logf("all agents ready, waiting for Start on the web page")
+		if err := c.pump("the start signal", 0, func() bool { return c.startNow }); err != nil {
+			return c.failure(err)
+		}
+	}
+	c.setPhase(phaseSetup)
 	if err := c.runSetup(); err != nil {
 		return c.failure(err)
 	}
@@ -344,6 +386,7 @@ func (c *ctl) pump(what string, timeout time.Duration, done func() bool) error {
 			c.apply(ev)
 		case <-ticker.C:
 			c.onTick()
+			c.publish()
 		case <-deadline:
 			return fmt.Errorf("timed out waiting for %s", what)
 		case <-c.ctx.Done():
@@ -413,6 +456,7 @@ func (c *ctl) release() {
 		c.send(a, proto.Msg{Type: proto.Resume, T: at + a.offsetMs})
 	}
 	c.started = time.UnixMilli(at)
+	c.setPhase(phaseRunning)
 	c.logf("test starts on all agents at %s", c.started.Format("15:04:05.000"))
 }
 
@@ -442,6 +486,7 @@ func (c *ctl) abort(reason string, code int) {
 	}
 	c.stopping = true
 	c.aborted, c.abortCode = reason, code
+	c.setPhase(phaseStopping)
 	c.logf("stopping all agents: %s", reason)
 	for _, a := range c.agents {
 		if !a.ended {
@@ -452,6 +497,7 @@ func (c *ctl) abort(reason string, code int) {
 }
 
 func (c *ctl) teardownAndFinish() {
+	c.setPhase(phaseTeardown)
 	first := c.agents[0]
 	if !first.lost {
 		c.send(first, proto.Msg{Type: proto.Teardown})
@@ -471,6 +517,10 @@ func (c *ctl) teardownAndFinish() {
 }
 
 func (c *ctl) apply(ev event) {
+	if ev.cmd != nil {
+		ev.cmd.done <- c.control(ev.cmd.name)
+		return
+	}
 	a := ev.a
 	if ev.err != nil {
 		if a.exited {
@@ -555,16 +605,15 @@ func (c *ctl) onFrame(a *agentState, f *agg.Frame) {
 	if f == nil {
 		return
 	}
-	c.mu.Lock()
 	c.fleet.Add(a.spec.Name, f)
 	c.tick.Add(a.spec.Name, f)
-	c.mu.Unlock()
 	if s := f.Series["iterations"]; s != nil {
 		a.iterations += s.Sum
 	}
 	if s := f.Series["http_reqs"]; s != nil {
 		a.requests += s.Sum
 	}
+	a.lastLag = f.LagMs
 	if f.LagMs > a.maxLag {
 		a.maxLag = f.LagMs
 	}
@@ -602,7 +651,6 @@ func (c *ctl) onTick() {
 	if c.started.IsZero() || time.Now().Before(c.started) {
 		return
 	}
-	c.mu.Lock()
 	t := c.tick
 	c.tick = agg.NewFleet()
 	c.second++
@@ -628,7 +676,6 @@ func (c *ctl) onTick() {
 		}
 	}
 	c.points = append(c.points, p)
-	c.mu.Unlock()
 	if c.second%5 == 0 {
 		c.logf("%4ds vus=%.0f reqs/s=%.0f p95=%.1fms failed=%.2f%% cpu_max=%.0f%%", c.second, p.VUs, p.Reqs, p.P95, 100*p.Failed, p.CPUMax)
 	}
@@ -643,8 +690,6 @@ func (c *ctl) checkAbort() {
 		return
 	}
 	el := c.elapsed()
-	c.mu.Lock()
-	defer c.mu.Unlock()
 	for _, t := range c.ts {
 		if !t.AbortOnFail || el < t.AbortDelay {
 			continue
@@ -693,9 +738,7 @@ func (c *ctl) finalise() (int, error) {
 		}
 	}
 	el := end.Sub(c.started)
-	c.mu.Lock()
 	d := c.snapshot(el)
-	c.mu.Unlock()
 	d.Aborted = c.aborted
 	d.Warnings = c.warnings
 
@@ -721,6 +764,7 @@ func (c *ctl) finalise() (int, error) {
 		}
 	}
 	d.ExitCode = code
+	c.final = d
 	d.WriteText(c.o.Stdout)
 	var errs []error
 	if c.o.Summary != "" {
@@ -741,16 +785,17 @@ func (c *ctl) serveMetrics() error {
 		c.o.OnListen(l.Addr().String())
 	}
 	mux := http.NewServeMux()
-	mux.HandleFunc("/metrics", func(w http.ResponseWriter, _ *http.Request) {
-		c.mu.Lock()
-		d := c.snapshot(c.elapsed())
-		c.mu.Unlock()
-		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
-		d.WriteProm(w)
-	})
-	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
-	go func() { _ = srv.Serve(l) }()
+	mux.HandleFunc("/metrics", c.handleMetrics)
+	c.metrics = &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	go func() { _ = c.metrics.Serve(l) }()
 	return nil
+}
+
+func (c *ctl) handleMetrics(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+	if s := c.live.Load(); s != nil {
+		s.data.WriteProm(w)
+	}
 }
 
 func (c *ctl) closeAll() {

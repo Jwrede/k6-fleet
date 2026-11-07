@@ -461,6 +461,126 @@ func TestKilledAgentAbortsAndTakesK6Along(t *testing.T) {
 	}
 }
 
+func webState(t *testing.T, port string) map[string]any {
+	t.Helper()
+	resp, err := http.Get("http://127.0.0.1:" + port + "/api/state")
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+	var s map[string]any
+	if resp.StatusCode == http.StatusOK {
+		if err := json.NewDecoder(resp.Body).Decode(&s); err != nil {
+			t.Errorf("state: %v", err)
+		}
+	}
+	return s
+}
+
+func webWait(t *testing.T, port, phase string, out *bytes.Buffer) map[string]any {
+	t.Helper()
+	for deadline := time.Now().Add(60 * time.Second); time.Now().Before(deadline); time.Sleep(100 * time.Millisecond) {
+		if s := webState(t, port); s != nil && s["phase"] == phase {
+			return s
+		}
+	}
+	t.Fatalf("phase %s not reached\n%s", phase, out.String())
+	return nil
+}
+
+func webPost(t *testing.T, port, action string) {
+	t.Helper()
+	req, _ := http.NewRequest(http.MethodPost, "http://127.0.0.1:"+port+"/api/"+action, nil)
+	req.Header.Set("X-K6-Fleet", "1")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("%s: %d", action, resp.StatusCode)
+	}
+}
+
+// Start and Stop from the page, checked at the target: nothing arrives before
+// Start, requests arrive afterwards, and they end with Stop.
+func TestWebStartAndStop(t *testing.T) {
+	tg := newTarget(t)
+	dir := t.TempDir()
+	sum := filepath.Join(dir, "s.json")
+	port := freePort(t)
+	cmd := exec.Command(fleetBin, "run", "--local", "2", "--web", "127.0.0.1:"+port, "--summary-export", sum, "scripts/web.js", "--", "-e", "BASE="+tg.url)
+	var out bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &out, &out
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer cmd.Process.Kill()
+	counts := func() (int, int, int) {
+		tg.mu.Lock()
+		defer tg.mu.Unlock()
+		return tg.setups, tg.requests, tg.teardown
+	}
+
+	webWait(t, port, "ready", &out)
+	time.Sleep(2 * time.Second)
+	if setups, requests, _ := counts(); setups != 0 || requests != 0 {
+		t.Fatalf("before Start: %d setups, %d requests", setups, requests)
+	}
+
+	webPost(t, port, "start")
+	webWait(t, port, "running", &out)
+	time.Sleep(5 * time.Second)
+	live := webState(t, port)
+	if setups, requests, _ := counts(); setups != 1 || requests == 0 {
+		t.Fatalf("after Start: %d setups, %d requests", setups, requests)
+	}
+	points, _ := live["timeline"].([]any)
+	agents, _ := live["agents"].([]any)
+	if len(points) < 2 || len(agents) != 2 {
+		t.Errorf("live state: %d points, %d agents", len(points), len(agents))
+	}
+
+	webPost(t, port, "stop")
+	end := webWait(t, port, "finished", &out)
+	_, stopped, teardowns := counts()
+	time.Sleep(2 * time.Second)
+	if _, later, _ := counts(); later != stopped {
+		t.Errorf("requests went on after the run ended: %d then %d", stopped, later)
+	}
+	if teardowns != 1 {
+		t.Errorf("teardown ran %d times", teardowns)
+	}
+	if end["exit_code"] != float64(105) {
+		t.Errorf("state after Stop: %v", end)
+	}
+
+	if err := cmd.Process.Signal(os.Interrupt); err != nil {
+		t.Fatal(err)
+	}
+	waited := make(chan error, 1)
+	go func() { waited <- cmd.Wait() }()
+	select {
+	case <-waited:
+	case <-time.After(20 * time.Second):
+		t.Fatalf("page did not close on interrupt:\n%s", out.String())
+	}
+	if c := cmd.ProcessState.ExitCode(); c != 105 {
+		t.Errorf("exit %d\n%s", c, out.String())
+	}
+	var s summary
+	b, err := os.ReadFile(sum)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(b, &s); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.Metrics["http_reqs"].Values["count"]; got == 0 || got > float64(stopped)+5 {
+		t.Errorf("summary counts %v requests, the target saw %d", got, stopped)
+	}
+}
+
 // Logs what the sample pipeline costs and where. There is no assertion, because
 // shared CI runners are too noisy for one; the README quotes the logged numbers.
 func TestOverheadAgainstPlainK6(t *testing.T) {

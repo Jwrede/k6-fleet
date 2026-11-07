@@ -66,6 +66,8 @@ k6-fleet run [flags] script.js [-- k6 archive flags]
   --summary-export f    merged summary as JSON
   --report f            self-contained HTML report
   --listen addr         live merged metrics at /metrics, Prometheus format
+  --web addr            live page with Start and Stop, see "Web page"
+  --autostart           with --web: start at once and exit when the run ends
   --out uri             extra k6 --out on every agent (repeatable)
   --on-agent-loss       abort (default) or continue
   --ready-timeout d     time for agents to initialise (default 2m)
@@ -91,6 +93,26 @@ An inventory sets per-agent options. `weight` gives an agent a larger segment, a
 The docker transport uses `docker create`, `cp` and `start`, so it also works with `DOCKER_HOST` or a docker context.
 
 Exit codes are those of k6: 0, 99 for thresholds, 105 for an interrupt, 107 for a script error, 108 for `exec.test.abort()`. In addition: 1 for an orchestration error and 3 for a lost agent.
+
+## Web page
+
+```
+k6-fleet run --ssh lg1,lg2,lg3 --web :8089 checkout.js
+```
+
+The controller then serves a page at `http://127.0.0.1:8089/`, embedded in the binary and without external assets. It shows the agents with state, segment, CPU and lag, requests per second, p(95), failed rate and VUs over time, and thresholds and checks on the merged data so far. `/metrics` is available at the same address. The idea came from [a comment in grafana/k6 #140](https://github.com/grafana/k6/issues/140#issuecomment-6679444658), which compared this to Locust's page.
+
+With `--web`, k6-fleet connects the agents, initialises k6 on all of them and waits for Start; `setup()` has not run at that point. Stop ends a running test like an interrupt: `teardown()` still runs, the summary is written, and the exit code is 105. Stop before the test has started removes the paused k6 instances without running anything. After the run, the page stays up with the final state until you press Ctrl-C, and the process then exits with the code of the run. `--autostart` drops both waits, so the test starts as soon as the agents are ready and the process exits when it ends. One process serves one run.
+
+A bare `:port` binds to localhost. On a loopback address, control needs no token, and the server rejects requests with a foreign `Host` header and control requests without the `X-K6-Fleet` header, so a website open in your browser cannot start a test. On any other address, such as `0.0.0.0:8089`, Start and Stop need a token, because the page can start load against every target in the script. Set it with `K6FLEET_WEB_TOKEN`, or k6-fleet generates one and prints it. The page and `/api/state` can be read without a token, and the server speaks plain HTTP, so on an untrusted network use an ssh tunnel or a TLS proxy in front of it.
+
+The page uses a small API, which also works from a script:
+
+```
+curl -s localhost:8089/api/state
+curl -X POST -H 'X-K6-Fleet: 1' localhost:8089/api/start
+curl -X POST -H 'X-K6-Fleet: 1' -H "Authorization: Bearer $K6FLEET_WEB_TOKEN" http://lg0:8089/api/stop
+```
 
 ## Example
 
@@ -141,6 +163,9 @@ Output from CI, real k6 v2.3.0, three agents, `e2e/scripts/shared.js`. The scrip
 - Exit 99 on a crossed threshold, as with plain k6, `abortOnFail` stopping all agents, and `exec.test.abort()` on one instance ending the run with 108.
 - Relative imports, `open()`, and CLI options after `--` reach the agents.
 - `kill -9` on an agent ends the run with exit 3 and removes its k6.
+- With `--web`, no request reaches the target before Start, requests arrive after it and end after Stop, `teardown()` runs once, and the exit code is 105.
+
+`go test ./internal/controller/` also covers the page's API against the stub: start, stop in each phase, a failed start, token handling and rejected cross-site requests. The page's own JavaScript has no automated test. It was driven once by hand in headless Chromium against the stub, including Start and Stop.
 
 ## Limits
 
@@ -151,6 +176,7 @@ Output from CI, real k6 v2.3.0, three agents, `e2e/scripts/shared.js`. The scrip
 - Percentiles have a relative error of at most 0.5 percent, so a threshold within that distance of its limit can go either way. Counts, rates, min, max and avg are exact.
 - A custom Gauge has no meaningful sum, so the newest sample across agents counts, compared by agent clocks. `vus` and `vus_max` are summed.
 - Agents were only tested on Linux. The macOS build compiles in CI and has not been run; without Linux's parent-death signal, k6 can outlive a killed agent there.
+- The web page cannot change the script, the agents or the load, and it starts one run per process, unlike Locust's page.
 - Environment variables such as `K6_*` are not forwarded to agents. Use `-e` and options after `--`, which end up in the archive.
 - The start is synchronised to the measured clock offset. Its precision depends on the round trip of the control connection.
 
