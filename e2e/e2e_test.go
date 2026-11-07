@@ -573,12 +573,19 @@ func TestWebControlsRealK6(t *testing.T) {
 		return func(s webAPI) bool { return s.Phase == "running" && s.VUs == n }
 	}
 	webUntil(t, port, "4 VUs", out, vus(4))
-	s := webUntil(t, port, "request rows", out, func(s webAPI) bool { return len(s.Requests) == 3 && len(s.Failures) > 0 && len(s.Errors) > 0 })
-	rows := map[string]uint64{}
-	for _, r := range s.Requests {
-		rows[r.Name] = r.Fails
+	// setup() and teardown() requests get rows too, as they do in k6's metrics.
+	fails := func(s webAPI) map[string]uint64 {
+		rows := map[string]uint64{}
+		for _, r := range s.Requests {
+			rows[r.Name] = r.Fails
+		}
+		return rows
 	}
-	if _, ok := rows["hit"]; !ok || rows["hit"] != 0 || rows["broken"] == 0 {
+	s := webUntil(t, port, "request rows", out, func(s webAPI) bool {
+		_, hit := fails(s)["hit"]
+		return hit && fails(s)["broken"] > 0 && len(s.Failures) > 0 && len(s.Errors) > 0
+	})
+	if fails(s)["hit"] != 0 {
 		t.Errorf("rows: %+v", s.Requests)
 	}
 	if s.Failures[0].Name != "broken" || s.Failures[0].Status != "500" {
@@ -618,7 +625,7 @@ func TestWebControlsRealK6(t *testing.T) {
 
 	webPost(t, port, "start", fmt.Sprintf(`{"duration":"3s","env":{"BASE":%q}}`, tg.url))
 	second := webUntil(t, port, "the end of run 2", out, func(s webAPI) bool { return s.Run == 2 && s.Phase == "finished" })
-	if second.ExitCode == nil || *second.ExitCode != 0 || len(second.Requests) != 2 || second.Requests[0].Fails != 0 {
+	if _, broken := fails(second)["broken"]; second.ExitCode == nil || *second.ExitCode != 0 || broken || fails(second)["hit"] != 0 {
 		t.Errorf("second run: %+v", second)
 	}
 	if setups, _, teardowns := counts(); setups != 2 || teardowns != 2 {

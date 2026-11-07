@@ -426,6 +426,7 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("GET /app.js", s.static(files))
 	mux.HandleFunc("GET /chart.js", s.static(files))
 	mux.HandleFunc("GET /style.css", s.static(files))
+	mux.HandleFunc("GET /favicon.ico", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) })
 	mux.HandleFunc("GET /api/state", s.handleState)
 	mux.HandleFunc("GET /api/logs", s.handleLogs)
 	mux.HandleFunc("POST /api/start", s.control(s.handleStart))
