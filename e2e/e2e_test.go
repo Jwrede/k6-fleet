@@ -462,8 +462,11 @@ func TestKilledAgentAbortsAndTakesK6Along(t *testing.T) {
 }
 
 type webAPI struct {
-	Phase    string  `json:"phase"`
-	Run      int     `json:"run"`
+	Phase    string `json:"phase"`
+	Run      int    `json:"run"`
+	Defaults struct {
+		LiveVUs bool `json:"live_vus"`
+	} `json:"defaults"`
 	VUs      float64 `json:"vus"`
 	ExitCode *int    `json:"exit_code"`
 	Requests []struct {
@@ -568,7 +571,15 @@ func TestWebControlsRealK6(t *testing.T) {
 		t.Fatalf("before Start: %d setups, %d requests", setups, requests)
 	}
 
-	webPost(t, port, "start", fmt.Sprintf(`{"vus":4,"env":{"BASE":%q,"FAIL":"1"}}`, tg.url))
+	live := webState(t, port).Defaults.LiveVUs
+	if v2 := strings.Contains(os.Getenv("K6FLEET_E2E_DOCKER_IMAGE"), ":2."); v2 == live {
+		t.Errorf("live VUs reported as %v", live)
+	}
+	duration := "60s"
+	if live {
+		duration = ""
+	}
+	webPost(t, port, "start", fmt.Sprintf(`{"vus":4,"duration":%q,"env":{"BASE":%q,"FAIL":"1"}}`, duration, tg.url))
 	vus := func(n float64) func(webAPI) bool {
 		return func(s webAPI) bool { return s.Phase == "running" && s.VUs == n }
 	}
@@ -604,10 +615,12 @@ func TestWebControlsRealK6(t *testing.T) {
 		t.Errorf("logs: %s", logs)
 	}
 
-	webPost(t, port, "vus", `{"vus":9}`)
-	webUntil(t, port, "9 VUs", out, vus(9))
-	webPost(t, port, "vus", `{"vus":3}`)
-	webUntil(t, port, "3 VUs", out, vus(3))
+	if live {
+		webPost(t, port, "vus", `{"vus":9}`)
+		webUntil(t, port, "9 VUs", out, vus(9))
+		webPost(t, port, "vus", `{"vus":3}`)
+		webUntil(t, port, "3 VUs", out, vus(3))
+	}
 
 	webPost(t, port, "stop", ``)
 	end := webUntil(t, port, "the end of run 1", out, func(s webAPI) bool { return s.Phase == "finished" })

@@ -369,7 +369,11 @@ function openStart() {
   $("f-vus").placeholder = d.max_vus ? "from the script: " + d.max_vus : "from the script";
   $("f-vus").value = last.vus || "";
   $("f-duration").value = last.duration || "";
-  $("f-duration-hint").textContent = "Empty means " + (d.duration ? d.duration + " from the script" : "the script's duration") + ". If VUs are set, empty means until you press Stop.";
+  $("f-vus-hint").textContent = d.live_vus
+    ? "Set a number to run the externally-controlled executor, which lets you change VUs during the run. Leave it empty to run the scenarios in the script."
+    : "Set a number to replace the scenarios in the script. k6 2.x cannot change VUs during a run.";
+  $("f-duration-hint").textContent = "Empty means " + (d.duration ? d.duration + " from the script" : "the script's duration") + ". " +
+    (d.live_vus ? "If VUs are set, empty means until you press Stop." : "VUs need a duration.");
   $("f-env").replaceChildren();
   for (const [k, v] of Object.entries(last.env || {})) envRow(k, v);
   $("f-token-row").hidden = !state.token_required;

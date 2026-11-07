@@ -15,6 +15,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -22,6 +23,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Jwrede/k6-fleet/internal/agent"
 	"github.com/Jwrede/k6-fleet/internal/agg"
 	"github.com/Jwrede/k6-fleet/internal/proto"
 	"github.com/Jwrede/k6-fleet/internal/report"
@@ -236,7 +238,7 @@ func (c *ctl) control(cmd *command) error {
 			return fmt.Errorf("cannot change VUs in phase %s", c.phase)
 		}
 		if c.o.Scenario == nil {
-			return errors.New("VUs can change only if the test was started with a number of VUs on the page")
+			return errors.New("VUs can change only on k6 1.x and if the test was started with a number of VUs on the page")
 		}
 		if cmd.vus > c.maxVUs {
 			c.maxVUs = cmd.vus
@@ -289,12 +291,15 @@ type runParams struct {
 type formDefaults struct {
 	MaxVUs   uint64 `json:"max_vus"`
 	Duration string `json:"duration"`
+	LiveVUs  bool   `json:"live_vus"`
 }
 
 var envName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
-// apply turns the form into options of one run.
-func (p runParams) apply(o Options) (Options, error) {
+// apply turns the form into options of one run. liveVUs says whether k6 can
+// change VUs during a run; k6 2.x removed that, so VUs are then fixed at the
+// start, and a test without an end cannot exist.
+func (p runParams) apply(o Options, liveVUs bool) (Options, error) {
 	o.K6Args = append([]string(nil), o.K6Args...)
 	if p.VUs < 0 {
 		return o, errors.New("VUs must not be negative")
@@ -310,8 +315,12 @@ func (p runParams) apply(o Options) (Options, error) {
 		}
 	}
 	switch {
-	case p.VUs > 0:
+	case p.VUs > 0 && liveVUs:
 		o.Scenario = &externalScenario{VUs: p.VUs, Duration: d.String()}
+	case p.VUs > 0 && d == 0:
+		return o, errors.New("this k6 version needs a duration together with VUs")
+	case p.VUs > 0:
+		o.K6Args = append(o.K6Args, "--vus", strconv.FormatInt(p.VUs, 10), "--duration", d.String())
 	case d > 0:
 		o.K6Args = append(o.K6Args, "--duration", d.String())
 	}
@@ -379,7 +388,7 @@ func serve(ctx context.Context, o Options) (int, error) {
 				return code, runErr
 			}
 		}
-		oo, err := p.apply(o)
+		oo, err := p.apply(o, s.defaults.LiveVUs)
 		if err != nil {
 			return ExitError, err // validated by the handler
 		}
@@ -401,6 +410,9 @@ func serve(ctx context.Context, o Options) (int, error) {
 // inspect reads the script's own VUs and duration for the form. A broken script
 // shows up on the page before anybody presses Start.
 func (s *server) inspect(ctx context.Context) {
+	if out, err := exec.CommandContext(ctx, s.o.K6, "version").Output(); err == nil {
+		s.defaults.LiveVUs = strings.HasPrefix(agent.ParseK6Version(string(out)), "v1.")
+	}
 	tmp, err := os.MkdirTemp("", "k6-fleet-ctl-")
 	if err != nil {
 		return
@@ -412,7 +424,7 @@ func (s *server) inspect(ctx context.Context) {
 		s.scriptEr = err.Error()
 		return
 	}
-	s.defaults = formDefaults{MaxVUs: info.MaxVUs, Duration: info.TotalDuration}
+	s.defaults.MaxVUs, s.defaults.Duration = info.MaxVUs, info.TotalDuration
 }
 
 func (s *server) routes() http.Handler {
@@ -541,7 +553,7 @@ func (s *server) handleStart(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if _, err := p.apply(s.o); err != nil {
+	if _, err := p.apply(s.o, s.defaults.LiveVUs); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}

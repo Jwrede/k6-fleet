@@ -115,7 +115,7 @@ The controller then serves a page at `http://127.0.0.1:8089/`, in the spirit of 
 
 **Start.** The form takes VUs, a duration and variables for `__ENV`. Leaving VUs empty runs the scenarios in the script; a duration then works like `k6 run --duration`. Nothing runs on the agents before Start: k6-fleet connects them and runs `setup()` after you press it.
 
-**Changing VUs during a run.** k6 can only do this with its `externally-controlled` executor. If you enter VUs in the form, k6-fleet replaces the scenarios of the test with that executor in the archive and calls the `default` function, so Edit can raise or lower VUs for the whole fleet. Each k6 applies its own segment. With an empty duration that test runs until Stop. Tests that run the script's own scenarios cannot be changed.
+**Changing VUs during a run** works on k6 1.x only. k6 does this with its `externally-controlled` executor, and k6 2.x removed both the executor and the REST call ("live VU configuration updates are not supported"). On 1.x, if you enter VUs in the form, k6-fleet replaces the scenarios of the test with that executor in the archive and calls the `default` function, so Edit can raise or lower VUs for the whole fleet, and each k6 applies its own segment. With an empty duration that test runs until Stop. On 2.x, VUs from the form need a duration and act like `k6 run --vus --duration`; the Edit button is not shown. Tests that run the script's own scenarios cannot be changed on either version.
 
 **Stop** ends a running test like an interrupt: `teardown()` still runs, the summary is written, and the exit code is 105. Before the test has started, it removes the k6 instances without running anything. **Reset stats** clears Statistics and Failures, as in Locust. Thresholds, checks and the summary keep all samples.
 
@@ -181,9 +181,9 @@ Output from CI, real k6 v2.3.0, three agents, `e2e/scripts/shared.js`. The scrip
 - Exit 99 on a crossed threshold, as with plain k6, `abortOnFail` stopping all agents, and `exec.test.abort()` on one instance ending the run with 108.
 - Relative imports, `open()`, and CLI options after `--` reach the agents.
 - `kill -9` on an agent ends the run with exit 3 and removes its k6.
-- From the page: no request reaches the target before Start, per-request rows, failures, script exceptions and `console.log` output appear, VUs follow the form and Edit, requests end after Stop, `teardown()` runs once, and a second test runs in the same process.
+- From the page: no request reaches the target before Start, per-request rows, failures, script exceptions and `console.log` output appear, VUs follow the form and, on k6 1.x, Edit, requests end after Stop, `teardown()` runs once, and a second test runs in the same process.
 
-`go test ./internal/controller/` covers the page's API against the stub: form validation, every action in each phase, downloads, token handling and rejected cross-site requests. `e2e/ui/ui.mjs` drives the page itself in headless Chrome over the DevTools protocol against real k6 in CI: the form, every tab, sorting, hiding columns, tooltip, legend, zoom, log filters, downloads, Edit, Reset, Stop and New test. It also fails on script errors or CSP violations in the browser.
+`go test ./internal/controller/` covers the page's API against the stub: form validation, every action in each phase, downloads, token handling and rejected cross-site requests. `e2e/ui/ui.mjs` drives the page itself in headless Chrome over the DevTools protocol against real k6 in CI: the form, every tab, sorting, hiding columns, tooltip, legend, zoom, log filters, downloads, Edit (on k6 1.x), Reset, Stop and New test. It also fails on script errors or CSP violations in the browser.
 
 ## Limits
 
@@ -198,6 +198,7 @@ Output from CI, real k6 v2.3.0, three agents, `e2e/scripts/shared.js`. The scrip
 - Per-request statistics need the tags of every `http_req_duration` sample, which leaves the fast parsing path for that metric, and they make frames larger. They are on with `--web` only and have not been benchmarked. Each agent tracks 500 method and name pairs, and further ones count as `(other names)`, so use `tags: { name: ... }` for URLs with IDs.
 - The Errors tab counts the first 200 lines of k6 output per agent, so an error logged on every iteration stops counting there. The Logs tab keeps 2000 lines.
 - In a test started with VUs from the form, the `default` function runs and scenarios in the script are ignored. A script without a `default` export fails at the start.
+- Live VU changes depend on an executor that k6 2.x removed, see "Web page". Locust's Edit has no such restriction.
 - Environment variables such as `K6_*` are not forwarded to agents. Use `-e` and options after `--`, which end up in the archive.
 - The start is synchronised to the measured clock offset. Its precision depends on the round trip of the control connection.
 

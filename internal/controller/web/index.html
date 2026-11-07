@@ -55,7 +55,7 @@
     <h2>Start a test</h2>
     <p id="form-script" class="m"></p>
     <label>VUs <input id="f-vus" type="number" min="1" step="1" inputmode="numeric"></label>
-    <p class="m small">Set a number to run <code>externally-controlled</code>, which lets you change VUs during the run. Leave it empty to run the scenarios in the script.</p>
+    <p class="m small" id="f-vus-hint"></p>
     <label>Duration <input id="f-duration" type="text" placeholder="30s, 5m, 1h" autocomplete="off"></label>
     <p class="m small" id="f-duration-hint"></p>
     <fieldset><legend>Environment (<code>__ENV</code>)</legend><div id="f-env"></div><button type="button" id="f-env-add">Add variable</button></fieldset>

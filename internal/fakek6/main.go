@@ -128,6 +128,9 @@ func archive(args []string) {
 			k, v, _ := strings.Cut(args[i+1], "=")
 			env[k] = v
 			i++
+		case "--vus", "--duration":
+			env[strings.TrimPrefix(args[i], "--")] = args[i+1]
+			i++
 		default:
 			src = args[i]
 		}

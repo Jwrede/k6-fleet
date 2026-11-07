@@ -63,8 +63,10 @@ try {
   await until(`document.getElementById('start-dialog').open`, 'start form opens on an idle page');
   ok(await ev(`document.getElementById('f-vus').placeholder.includes('from the script')`), 'form shows the VUs of the script');
   await shot('form');
+  const live = await ev(`state.defaults.live_vus`);
   await ev(`(() => { const d = document;
     d.getElementById('f-vus').value = '4';
+    d.getElementById('f-duration').value = ${live ? "''" : "'60s'"};
     d.getElementById('f-env-add').click(); d.getElementById('f-env-add').click();
     const rows = d.querySelectorAll('.envrow');
     rows[0].querySelectorAll('input')[0].value = 'BASE'; rows[0].querySelectorAll('input')[1].value = ${JSON.stringify(base)};
@@ -72,7 +74,7 @@ try {
     d.getElementById('f-start').click(); })()`);
   await until(`!document.getElementById('start-dialog').open`, 'form closes after Start');
   await until(`${text('#m-status')}.startsWith('running')`, 'status shows running');
-  await until(`${text('#m-vus')} === '4 / 4'`, 'monitor shows 4 of 4 VUs');
+  await until(`${text('#m-vus')} === ${live ? "'4 / 4'" : "'4'"}`, 'monitor shows 4 VUs');
   await until(`[...document.querySelectorAll('#stats td.name')].some(t => t.textContent === 'hit')`, 'statistics list the request name');
   ok(await ev(`document.querySelector('#stats tr:last-child').classList.contains('total')`), 'total row comes last');
   await until(`parseFloat(${text('#m-rps')}) > 0`, 'monitor shows RPS');
@@ -128,10 +130,14 @@ try {
   ok(files.length === 7 && files.every((c) => c === 200), `downloads answer (${files})`);
 
   await tab('stats');
-  await ev(`document.getElementById('edit').click()`);
-  ok(await ev(`document.getElementById('e-vus').value === '4'`), 'edit form shows the current VUs');
-  await ev(`document.getElementById('e-vus').value = '6'; document.querySelector('#edit-form button[type=submit]').click()`);
-  await until(`${text('#m-vus')} === '6 / 6'`, 'monitor follows the new VUs');
+  if (live) {
+    await ev(`document.getElementById('edit').click()`);
+    ok(await ev(`document.getElementById('e-vus').value === '4'`), 'edit form shows the current VUs');
+    await ev(`document.getElementById('e-vus').value = '6'; document.querySelector('#edit-form button[type=submit]').click()`);
+    await until(`${text('#m-vus')} === '6 / 6'`, 'monitor follows the new VUs');
+  } else {
+    ok(await ev(`document.getElementById('edit').hidden`), 'no Edit button without live VUs');
+  }
   const count = () => ev(`Number(document.querySelector('#stats tr.total td:nth-child(3)').textContent.replaceAll(',', ''))`);
   const reqs = await count();
   await ev(`document.getElementById('reset').click()`);

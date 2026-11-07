@@ -207,6 +207,7 @@ func TestWebStopEndsTheRunLikeAnInterrupt(t *testing.T) {
 }
 
 func TestWebChangesVUsDuringARun(t *testing.T) {
+	t.Setenv("FAKEK6_VERSION", "v1.8.2")
 	var before, after apiState
 	r := webRun(t, cfg{"iterations": 10, "paceMs": 20}, 2, nil, func(p page, _ string) {
 		p.mustPost("/api/start", `{"vus":4}`)
@@ -246,12 +247,38 @@ func TestWebRefusesVUsForScriptScenarios(t *testing.T) {
 		p.mustPost("/api/stop", ``)
 		p.waitFor(phaseFinished, phaseFailed)
 	})
-	if code != http.StatusConflict || !strings.Contains(text, "only if") {
+	if code != http.StatusConflict || !strings.Contains(text, "can change only") {
 		t.Errorf("%d %s", code, text)
 	}
 }
 
+func TestWebFixesVUsOnK6Two(t *testing.T) {
+	var noDuration int
+	var live bool
+	var state apiState
+	r := webRun(t, cfg{"iterations": 200, "paceMs": 20}, 2, nil, func(p page, _ string) {
+		live = p.state().Defaults.LiveVUs
+		noDuration, _ = p.post("/api/start", `{"vus":4}`)
+		p.mustPost("/api/start", `{"vus":4,"duration":"2s"}`)
+		state = p.waitFor(phaseRunning)
+		if code, _ := p.post("/api/vus", `{"vus":8}`); code != http.StatusConflict {
+			t.Errorf("edit on k6 2.x: %d", code)
+		}
+		p.waitFor(phaseFinished, phaseFailed)
+	})
+	if live || state.Adjustable {
+		t.Errorf("k6 2.x has no live VUs: %v %+v", live, state)
+	}
+	if noDuration != http.StatusBadRequest {
+		t.Errorf("VUs without a duration: %d", noDuration)
+	}
+	if r.count(`env {"duration":"2s","vus":"4"}`) != 2 {
+		t.Errorf("flags must reach k6 archive:\n%s", strings.Join(r.events, "\n"))
+	}
+}
+
 func TestWebDurationFromTheFormEndsTheRun(t *testing.T) {
+	t.Setenv("FAKEK6_VERSION", "v1.8.2")
 	var end apiState
 	r := webRun(t, cfg{"iterations": 10, "paceMs": 20}, 2, nil, func(p page, _ string) {
 		p.mustPost("/api/start", `{"vus":2,"duration":"2s"}`)
