@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"strconv"
 	"testing"
 	"time"
 
@@ -213,5 +214,69 @@ func BenchmarkFeed(b *testing.B) {
 		if i%100000 == 0 {
 			a.Flush()
 		}
+	}
+}
+
+func feedRequest(a *Aggregator, name, status, expected string, ms float64) {
+	a.Feed([]byte(`{"metric":"http_req_duration","type":"Point","data":{"time":"2026-11-07T08:00:00Z","value":` +
+		strconv.FormatFloat(ms, 'f', -1, 64) + `,"tags":{"method":"GET","name":"` + name + `","status":"` + status + `","expected_response":"` + expected + `"}}}`))
+}
+
+func TestPerRequestStatistics(t *testing.T) {
+	a := New(nil)
+	a.Feed([]byte(`{"type":"Metric","data":{"name":"http_req_duration","type":"trend","contains":"time"},"metric":"http_req_duration"}`))
+	a.PerRequest()
+	feedRequest(a, "/a", "200", "true", 10)
+	feedRequest(a, "/a", "500", "false", 30)
+	feedRequest(a, "/b", "200", "true", 5)
+	f := a.Flush()
+	s := f.Requests[RequestKey("GET", "/a")]
+	if s == nil || s.Count != 2 || s.NonZero != 1 || f.Failures[FailureKey("GET", "/a", "500", "")] != 1 {
+		t.Fatalf("%+v %+v", s, f.Failures)
+	}
+	if f.Series["http_req_duration"].Count != 3 {
+		t.Error("the metric itself must still count every sample")
+	}
+	fl := NewFleet()
+	fl.Add("x", f)
+	fl.Add("y", &Frame{Requests: map[string]*Series{RequestKey("GET", "/a"): s}, Failures: f.Failures})
+	if got := fl.Requests[RequestKey("GET", "/a")].Count; got != 4 {
+		t.Errorf("merged count %d", got)
+	}
+	if got := fl.Failures[FailureKey("GET", "/a", "500", "")]; got != 2 {
+		t.Errorf("merged failures %d", got)
+	}
+	fl.ResetRequests()
+	if len(fl.Requests) != 0 || fl.Series["http_req_duration"].Count != 3 {
+		t.Errorf("reset must leave the series: %+v", fl.Series)
+	}
+}
+
+func TestPerRequestOffKeepsTheFastPath(t *testing.T) {
+	a := New(nil)
+	a.Feed([]byte(`{"type":"Metric","data":{"name":"http_req_duration","type":"trend","contains":"time"},"metric":"http_req_duration"}`))
+	feedRequest(a, "/a", "200", "true", 10)
+	if f := a.Flush(); f.Requests != nil {
+		t.Errorf("%+v", f.Requests)
+	}
+}
+
+func TestRequestNamesAreBounded(t *testing.T) {
+	a := New(nil)
+	a.Feed([]byte(`{"type":"Metric","data":{"name":"http_req_duration","type":"trend","contains":"time"},"metric":"http_req_duration"}`))
+	a.PerRequest()
+	for i := 0; i < MaxRequestNames+50; i++ {
+		feedRequest(a, "/user/"+strconv.Itoa(i), "200", "true", 1)
+	}
+	feedRequest(a, "/user/0", "200", "true", 1)
+	f := a.Flush()
+	if len(f.Requests) != MaxRequestNames+1 {
+		t.Fatalf("%d keys", len(f.Requests))
+	}
+	if got := f.Requests[RequestKey("GET", OtherRequests)].Count; got != 50 {
+		t.Errorf("overflow row has %d", got)
+	}
+	if got := f.Requests[RequestKey("GET", "/user/0")].Count; got != 2 {
+		t.Errorf("known names keep counting: %d", got)
 	}
 }

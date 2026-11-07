@@ -48,9 +48,10 @@ type Options struct {
 	Summary    string
 	HTML       string
 	Listen     string // Prometheus endpoint address
-	Web        string // web page address; the run waits for Start unless Autostart
+	Web        string // web page address; runs start from the page unless Autostart
 	WebToken   string // token for control actions; generated if the address needs one
-	Autostart  bool   // with Web: start at once and exit when the run ends
+	Autostart  bool   // with Web: one run at once, exit when it ends
+	Scenario   *externalScenario
 	OnLoss     string // abort or continue
 	Ready      time.Duration
 	MaxRun     time.Duration // 0: derive from the script
@@ -88,6 +89,8 @@ type agentState struct {
 	cpuSum, cpuMax float64
 	cpuN           int
 	lastCPU        float64
+	vus            float64
+	memBytes       int64
 	hotSeconds     int
 	maxLag         int64
 	lastLag        int64
@@ -118,12 +121,13 @@ type ctl struct {
 	script string
 	total  string // planned duration from k6 inspect
 
-	phase    string
-	startNow bool
-	token    string
-	web      *http.Server
-	metrics  *http.Server
-	live     atomic.Pointer[liveState] // the only state HTTP handlers read
+	phase     string
+	book      *logBook // nil without the web page
+	window    []tickCounts
+	targetVUs int64
+	maxVUs    int64
+	metrics   *http.Server
+	live      atomic.Pointer[liveState] // the only state HTTP handlers read
 
 	final      *report.Data
 	fatal      error
@@ -154,21 +158,25 @@ func Run(ctx context.Context, o Options) (int, error) {
 	if o.Stderr == nil {
 		o.Stderr = os.Stderr
 	}
-	c := &ctl{
+	if o.Web != "" {
+		return serve(ctx, o)
+	}
+	return newCtl(ctx, o).execute()
+}
+
+func newCtl(ctx context.Context, o Options) *ctl {
+	return &ctl{
 		o: o, ctx: ctx, events: make(chan event, 1024), warned: map[string]bool{},
 		fleet: agg.NewFleet(), tick: agg.NewFleet(), script: filepath.Base(o.Script),
 	}
+}
+
+func (c *ctl) execute() (int, error) {
 	code, err := c.run()
 	c.closeAll()
 	c.publishEnd(code, err)
-	if c.web != nil && !o.Autostart {
-		c.logf("run ended with exit code %d; the page stays up until interrupted", code)
-		<-ctx.Done()
-	}
-	for _, s := range []*http.Server{c.web, c.metrics} {
-		if s != nil {
-			_ = s.Close()
-		}
+	if c.metrics != nil {
+		_ = c.metrics.Close()
 	}
 	return code, err
 }
@@ -177,6 +185,7 @@ func (c *ctl) logf(format string, args ...any) {
 	if !c.o.Quiet {
 		fmt.Fprintf(c.o.Stderr, format+"\n", args...)
 	}
+	c.book.add("controller", fmt.Sprintf(format, args...))
 }
 
 func (c *ctl) warn(key, format string, args ...any) {
@@ -187,6 +196,7 @@ func (c *ctl) warn(key, format string, args ...any) {
 	s := fmt.Sprintf(format, args...)
 	c.warnings = append(c.warnings, s)
 	fmt.Fprintln(c.o.Stderr, "WARNING: "+s)
+	c.book.addLevel("controller", "warning", s)
 }
 
 func (c *ctl) run() (int, error) {
@@ -195,11 +205,6 @@ func (c *ctl) run() (int, error) {
 		return ExitError, err
 	}
 	defer os.RemoveAll(tmp)
-	if c.o.Web != "" {
-		if err := c.serveWeb(); err != nil {
-			return ExitError, err
-		}
-	}
 	c.setPhase(phaseConnecting)
 	archive, info, err := c.buildArchive(tmp)
 	if err != nil {
@@ -242,20 +247,12 @@ func (c *ctl) run() (int, error) {
 		}
 		c.send(a, proto.Msg{Type: proto.Prepare, Prepare: &proto.PrepareBody{
 			Archive: archive, Segment: a.segment, Sequence: plan.Sequence, Instance: a.idx,
-			K6: k6, Out: c.o.AgentOut, Specs: specs,
+			K6: k6, Out: c.o.AgentOut, Specs: specs, PerRequest: c.o.Web != "",
 		}})
 	}
 	c.setPhase(phaseInitialising)
 	if err := c.pump("all k6 instances to initialise", c.o.Ready, func() bool { return c.all(func(a *agentState) bool { return a.ready }) }); err != nil {
 		return c.failure(err)
-	}
-	if c.web != nil && !c.o.Autostart {
-		// setup() can change the target, so it waits for the operator too.
-		c.setPhase(phaseReady)
-		c.logf("all agents ready, waiting for Start on the web page")
-		if err := c.pump("the start signal", 0, func() bool { return c.startNow }); err != nil {
-			return c.failure(err)
-		}
 	}
 	c.setPhase(phaseSetup)
 	if err := c.runSetup(); err != nil {
@@ -291,6 +288,9 @@ type inspectInfo struct {
 func (c *ctl) buildArchive(dir string) ([]byte, *inspectInfo, error) {
 	path := filepath.Join(dir, "archive.tar")
 	args := append([]string{"archive", "-O", path}, c.o.K6Args...)
+	if c.o.Scenario != nil {
+		c.targetVUs, c.maxVUs = c.o.Scenario.VUs, c.o.Scenario.VUs
+	}
 	args = append(args, c.o.Script)
 	if out, err := exec.CommandContext(c.ctx, c.o.K6, args...).CombinedOutput(); err != nil {
 		var ee *exec.ExitError
@@ -298,6 +298,11 @@ func (c *ctl) buildArchive(dir string) ([]byte, *inspectInfo, error) {
 			c.fatalCode = ee.ExitCode() // a script error stays exit 107, as in k6 run
 		}
 		return nil, nil, fmt.Errorf("k6 archive: %w\n%s", err, out)
+	}
+	if c.o.Scenario != nil {
+		if err := c.o.Scenario.apply(path); err != nil {
+			return nil, nil, err
+		}
 	}
 	out, err := exec.CommandContext(c.ctx, c.o.K6, "inspect", "--execution-requirements", path).Output()
 	if err != nil {
@@ -462,7 +467,7 @@ func (c *ctl) release() {
 
 func (c *ctl) waitForEnd(total string) error {
 	limit := c.o.MaxRun
-	if d, err := time.ParseDuration(total); err == nil && limit == 0 {
+	if d, err := time.ParseDuration(total); err == nil && limit == 0 && !c.o.Scenario.endless() {
 		limit = d + 2*time.Minute + c.o.StartDelay
 	}
 	err := c.pump("the test to end", limit, func() bool { return c.all(func(a *agentState) bool { return a.ended }) })
@@ -518,7 +523,7 @@ func (c *ctl) teardownAndFinish() {
 
 func (c *ctl) apply(ev event) {
 	if ev.cmd != nil {
-		ev.cmd.done <- c.control(ev.cmd.name)
+		ev.cmd.done <- c.control(ev.cmd)
 		return
 	}
 	a := ev.a
@@ -553,7 +558,10 @@ func (c *ctl) apply(ev event) {
 	case proto.FrameMsg:
 		c.onFrame(a, m.Frame)
 	case proto.Log:
-		c.logf("[%s] %s", a.spec.Name, m.Text)
+		if !c.o.Quiet {
+			fmt.Fprintf(c.o.Stderr, "[%s] %s\n", a.spec.Name, m.Text)
+		}
+		c.book.add(a.spec.Name, m.Text)
 	case proto.Error:
 		if c.started.IsZero() {
 			c.fatal = fmt.Errorf("agent %s: %s", a.spec.Name, m.Text)
@@ -614,6 +622,10 @@ func (c *ctl) onFrame(a *agentState, f *agg.Frame) {
 		a.requests += s.Sum
 	}
 	a.lastLag = f.LagMs
+	a.memBytes = f.MemBytes
+	if s := f.Series["vus"]; s != nil {
+		a.vus = s.Last
+	}
 	if f.LagMs > a.maxLag {
 		a.maxLag = f.LagMs
 	}
@@ -665,11 +677,13 @@ func (c *ctl) onTick() {
 		p.Iters = s.Sum
 	}
 	if s := t.Series["http_req_duration"]; s != nil && s.Sketch != nil {
-		p.P95 = s.Sketch.Quantile(0.95)
+		p.P50, p.P95, p.P99 = s.Sketch.Quantile(0.5), s.Sketch.Quantile(0.95), s.Sketch.Quantile(0.99)
 	}
 	if s := t.Series["http_req_failed"]; s != nil && s.Count > 0 {
+		p.Fails = float64(s.NonZero)
 		p.Failed = float64(s.NonZero) / float64(s.Count)
 	}
+	c.noteTick(t)
 	for _, a := range c.agents {
 		if a.lastCPU > p.CPUMax {
 			p.CPUMax = a.lastCPU
@@ -714,6 +728,10 @@ func (c *ctl) snapshot(el time.Duration) *report.Data {
 	d.AttachThresholds()
 	d.Checks = report.Checks(c.fleet)
 	d.Timeline = append([]report.Point(nil), c.points...)
+	if c.o.Web != "" {
+		d.Requests = report.Requests(c.fleet, c.requestRate)
+		d.Failures = report.Failures(c.fleet)
+	}
 	for _, a := range c.agents {
 		r := report.AgentResult{
 			Name: a.spec.Name, Segment: a.segment, Iterations: a.iterations, Requests: a.requests,

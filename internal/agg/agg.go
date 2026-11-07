@@ -104,6 +104,13 @@ type Frame struct {
 	BadLines uint64             `json:"bad,omitempty"`
 	LagMs    int64              `json:"lag,omitempty"`
 	CPU      float64            `json:"cpu,omitempty"`
+	MemBytes int64              `json:"mem,omitempty"` // resident size of k6
+
+	// Requests and Failures are only filled when per-request statistics were
+	// asked for. A Requests series is a Trend of http_req_duration whose NonZero
+	// counts failed requests.
+	Requests map[string]*Series `json:"rq,omitempty"`
+	Failures map[string]uint64  `json:"fl,omitempty"`
 }
 
 // Spec asks for a submetric, with Key being the k6 notation.
@@ -142,6 +149,27 @@ type Aggregator struct {
 	frame *Frame
 	now   func() time.Time
 	seen  uint64
+
+	perRequest bool
+	names      map[string]bool // request keys sent so far, bounded by MaxRequestNames
+}
+
+// MaxRequestNames bounds the request keys one agent reports. k6 uses the URL as
+// the name unless the script sets one, so a URL with an ID in it would otherwise
+// grow without limit. Further names count as OtherRequests.
+const MaxRequestNames = 500
+
+// OtherRequests is the name that collects requests beyond MaxRequestNames.
+const OtherRequests = "(other names)"
+
+const durationMetric = "http_req_duration"
+
+// PerRequest turns on statistics per method and name. The tags of every
+// http_req_duration sample then have to be decoded, which costs the fast path
+// for that metric.
+func (a *Aggregator) PerRequest() {
+	a.perRequest = true
+	a.names = map[string]bool{}
 }
 
 // New returns an Aggregator that also tracks the given submetrics.
@@ -194,6 +222,9 @@ func (a *Aggregator) fastPoint(b []byte) bool {
 	name := rest[:i]
 	info, ok := a.types[string(name)]
 	if !ok || info.typ == Gauge || string(name) == "checks" || len(a.specs[string(name)]) > 0 {
+		return false
+	}
+	if a.perRequest && string(name) == durationMetric {
 		return false
 	}
 	rest = rest[i:]
@@ -268,6 +299,9 @@ func (a *Aggregator) point(l *wireLine) {
 			a.series(s.Key, info).add(l.Data.Value, ms)
 		}
 	}
+	if a.perRequest && l.Metric == durationMetric {
+		a.request(l.Data.Tags, l.Data.Value)
+	}
 	if l.Metric == "checks" {
 		key := CheckKey(l.Data.Tags["group"], l.Data.Tags["check"])
 		c := a.frame.Checks[key]
@@ -283,6 +317,35 @@ func (a *Aggregator) point(l *wireLine) {
 	}
 	if a.seen++; a.seen%512 == 1 && !t.IsZero() {
 		a.noteLag(t)
+	}
+}
+
+func (a *Aggregator) request(tags map[string]string, v float64) {
+	name := tags["name"]
+	if name == "" {
+		name = tags["url"]
+	}
+	key := RequestKey(tags["method"], name)
+	if !a.names[key] {
+		if len(a.names) >= MaxRequestNames {
+			name = OtherRequests
+			key = RequestKey(tags["method"], name)
+		} else {
+			a.names[key] = true
+		}
+	}
+	if a.frame.Requests == nil {
+		a.frame.Requests, a.frame.Failures = map[string]*Series{}, map[string]uint64{}
+	}
+	s := a.frame.Requests[key]
+	if s == nil {
+		s = newSeries(Trend, "time")
+		a.frame.Requests[key] = s
+	}
+	s.add(v, 0)
+	if tags["expected_response"] == "false" {
+		s.NonZero++
+		a.frame.Failures[FailureKey(tags["method"], name, tags["status"], tags["error"])]++
 	}
 }
 
@@ -311,6 +374,14 @@ func (a *Aggregator) Flush() *Frame {
 	return f
 }
 
+// RequestKey joins a method and a request name.
+func RequestKey(method, name string) string { return method + "\x1f" + name }
+
+// FailureKey joins the fields that identify a kind of failure.
+func FailureKey(method, name, status, errText string) string {
+	return method + "\x1f" + name + "\x1f" + status + "\x1f" + errText
+}
+
 // CheckKey joins a k6 group path and check name.
 func CheckKey(group, name string) string { return group + "\x1f" + name }
 
@@ -322,16 +393,21 @@ func SplitCheckKey(key string) (group, name string) {
 
 // Fleet is the merged view over all agents.
 type Fleet struct {
-	Series map[string]*Series
-	Checks map[string]*Check
-	Lines  uint64
-	Bad    uint64
-	gauges map[string]map[string]float64
+	Series   map[string]*Series
+	Checks   map[string]*Check
+	Requests map[string]*Series
+	Failures map[string]uint64
+	Lines    uint64
+	Bad      uint64
+	gauges   map[string]map[string]float64
 }
 
 // NewFleet returns an empty Fleet.
 func NewFleet() *Fleet {
-	return &Fleet{Series: map[string]*Series{}, Checks: map[string]*Check{}, gauges: map[string]map[string]float64{}}
+	return &Fleet{
+		Series: map[string]*Series{}, Checks: map[string]*Check{}, gauges: map[string]map[string]float64{},
+		Requests: map[string]*Series{}, Failures: map[string]uint64{},
+	}
 }
 
 // summedGauges add up across instances. Any other gauge is a single reading of
@@ -363,6 +439,23 @@ func (f *Fleet) Add(agent string, fr *Frame) {
 		t.Pass += c.Pass
 		t.Fail += c.Fail
 	}
+	for k, d := range fr.Requests {
+		s := f.Requests[k]
+		if s == nil {
+			s = newSeries(Trend, "time")
+			f.Requests[k] = s
+		}
+		s.merge(d)
+	}
+	for k, n := range fr.Failures {
+		f.Failures[k] += n
+	}
+}
+
+// ResetRequests clears the per-request statistics and leaves everything that
+// thresholds and the summary are computed from.
+func (f *Fleet) ResetRequests() {
+	f.Requests, f.Failures = map[string]*Series{}, map[string]uint64{}
 }
 
 func (f *Fleet) addSummedGauge(key, agent string, s, d *Series) {

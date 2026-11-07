@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>k6-fleet</title>
+<link rel="stylesheet" href="style.css">
+</head><body>
+<header class="nav">
+  <div class="brand"><b>k6-fleet</b><span id="script" class="m"></span></div>
+  <dl class="monitor">
+    <div><dt>Status</dt><dd id="m-status">-</dd></div>
+    <div><dt>Time</dt><dd id="m-time">-</dd></div>
+    <div><dt>VUs</dt><dd id="m-vus">-</dd></div>
+    <div><dt>Agents</dt><dd id="m-agents">-</dd></div>
+    <div><dt>RPS</dt><dd id="m-rps">-</dd></div>
+    <div><dt>Failures</dt><dd id="m-fail">-</dd></div>
+  </dl>
+  <div class="controls">
+    <button id="new" class="primary" hidden>New test</button>
+    <button id="edit" hidden>Edit</button>
+    <button id="stop" class="danger" hidden>Stop</button>
+    <button id="reset" hidden>Reset stats</button>
+    <button id="theme" title="Switch between light and dark" aria-label="Switch between light and dark">Theme</button>
+  </div>
+</header>
+<p id="message" class="banner" role="alert" hidden></p>
+<div id="warnings"></div>
+<nav class="tabs" id="tabs" role="tablist"></nav>
+<main>
+  <section id="tab-stats" hidden><div class="tools"><details class="cols"><summary>Columns</summary><div id="stats-cols"></div></details></div><div class="w"><table id="stats"></table></div><p class="m empty" id="stats-empty">No requests yet.</p></section>
+  <section id="tab-charts" hidden><p class="m hint">Drag across a chart to zoom, double-click to reset. Click a legend entry to hide its line.</p><div id="charts"></div></section>
+  <section id="tab-failures" hidden><div class="w"><table id="failures"></table></div><p class="m empty" id="failures-empty">No failed requests.</p></section>
+  <section id="tab-errors" hidden><div class="w"><table id="errors"></table></div><p class="m empty" id="errors-empty">No errors logged by the script or the agents.</p></section>
+  <section id="tab-thresholds" hidden>
+    <h2 id="thresholds-h">Thresholds</h2><div class="w"><table id="thresholds"></table></div><p class="m empty" id="thresholds-empty">The script defines no thresholds.</p>
+    <h2>Checks</h2><div class="w"><table id="checks"></table></div><p class="m empty" id="checks-empty">No checks have run.</p>
+  </section>
+  <section id="tab-agents" hidden><div class="w"><table id="agents"></table></div></section>
+  <section id="tab-logs" hidden>
+    <div class="tools">
+      <select id="log-level" aria-label="Level"><option value="">All levels</option><option value="warning">Warnings and errors</option><option value="error">Errors</option></select>
+      <select id="log-source" aria-label="Source"><option value="">All sources</option></select>
+      <input id="log-search" type="search" placeholder="Filter" aria-label="Filter">
+      <label><input id="log-follow" type="checkbox" checked> Follow</label>
+    </div>
+    <div id="log" class="log" tabindex="0"></div>
+  </section>
+  <section id="tab-downloads" hidden>
+    <ul class="downloads" id="downloads"></ul>
+    <p class="m">Files describe the current or most recent test.</p>
+  </section>
+  <p class="m foot">Percentiles have a relative error of at most 0.5 percent. All other values are exact.</p>
+</main>
+
+<dialog id="start-dialog">
+  <form id="start-form" method="dialog">
+    <h2>Start a test</h2>
+    <p id="form-script" class="m"></p>
+    <label>VUs <input id="f-vus" type="number" min="1" step="1" inputmode="numeric"></label>
+    <p class="m small">Set a number to run <code>externally-controlled</code>, which lets you change VUs during the run. Leave it empty to run the scenarios in the script.</p>
+    <label>Duration <input id="f-duration" type="text" placeholder="30s, 5m, 1h" autocomplete="off"></label>
+    <p class="m small" id="f-duration-hint"></p>
+    <fieldset><legend>Environment (<code>__ENV</code>)</legend><div id="f-env"></div><button type="button" id="f-env-add">Add variable</button></fieldset>
+    <label id="f-token-row" hidden>Control token <input id="f-token" type="password" autocomplete="off"></label>
+    <p id="f-error" class="bad" role="alert" hidden></p>
+    <div class="actions"><button type="button" id="f-cancel">Cancel</button><button type="submit" id="f-start" class="primary">Start</button></div>
+  </form>
+</dialog>
+<dialog id="edit-dialog">
+  <form id="edit-form" method="dialog">
+    <h2>Change VUs</h2>
+    <label>VUs across all agents <input id="e-vus" type="number" min="0" step="1" required></label>
+    <p id="e-error" class="bad" role="alert" hidden></p>
+    <div class="actions"><button type="button" id="e-cancel">Cancel</button><button type="submit" class="primary">Apply</button></div>
+  </form>
+</dialog>
+<script src="chart.js"></script>
+<script src="app.js"></script>
+</body></html>

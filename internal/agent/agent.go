@@ -117,6 +117,9 @@ func (a *agent) handle(m proto.Msg) (done bool) {
 		}()
 	case proto.Stop:
 		a.patchStatus(`{"stopped":true}`)
+	case proto.SetVUs:
+		// VUs are initialised inside this call, which can take a while.
+		go a.patchStatus(fmt.Sprintf(`{"vus":%d,"vus-max":%d}`, m.VUs, m.MaxVUs))
 	case proto.Finish:
 		a.finish()
 		return true
@@ -151,6 +154,9 @@ func (a *agent) prepare(p *proto.PrepareBody) error {
 	}
 	a.api = "http://127.0.0.1:" + strconv.Itoa(port)
 	a.aggr = agg.New(p.Specs)
+	if p.PerRequest {
+		a.aggr.PerRequest()
+	}
 	a.exited = make(chan struct{})
 	a.drained = make(chan struct{})
 
@@ -309,11 +315,21 @@ func (a *agent) frames() {
 	}
 }
 
+func (a *agent) k6PID() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.cmd == nil || a.cmd.Process == nil {
+		return 0
+	}
+	return a.cmd.Process.Pid
+}
+
 func (a *agent) sendFrame(cpu float64) {
 	a.mu.Lock()
 	f := a.aggr.Flush()
 	a.mu.Unlock()
 	f.CPU = cpu
+	f.MemBytes = residentBytes(a.k6PID())
 	a.send(proto.Msg{Type: proto.FrameMsg, Frame: f})
 }
 

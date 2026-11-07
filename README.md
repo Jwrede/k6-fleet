@@ -100,17 +100,35 @@ Exit codes are those of k6: 0, 99 for thresholds, 105 for an interrupt, 107 for 
 k6-fleet run --ssh lg1,lg2,lg3 --web :8089 checkout.js
 ```
 
-The controller then serves a page at `http://127.0.0.1:8089/`, embedded in the binary and without external assets. It shows the agents with state, segment, CPU and lag, requests per second, p(95), failed rate and VUs over time, and thresholds and checks on the merged data so far. `/metrics` is available at the same address. The idea came from [a comment in grafana/k6 #140](https://github.com/grafana/k6/issues/140#issuecomment-6679444658), which compared this to Locust's page.
+The controller then serves a page at `http://127.0.0.1:8089/`, in the spirit of Locust's web UI and embedded in the binary without external assets. The idea came from [a comment in grafana/k6 #140](https://github.com/grafana/k6/issues/140#issuecomment-6679444658). The process stays up and runs one test after another until you press Ctrl-C, then exits with the code of the last test.
 
-With `--web`, k6-fleet connects the agents, initialises k6 on all of them and waits for Start; `setup()` has not run at that point. Stop ends a running test like an interrupt: `teardown()` still runs, the summary is written, and the exit code is 105. Stop before the test has started removes the paused k6 instances without running anything. After the run, the page stays up with the final state until you press Ctrl-C, and the process then exits with the code of the run. `--autostart` drops both waits, so the test starts as soon as the agents are ready and the process exits when it ends. One process serves one run.
+| Tab | Content |
+|---|---|
+| Statistics | One row per method and request name, with a total: requests, fails, median, p(90), p(95), p(99), average, min, max, current RPS and failures/s, share. Columns can be sorted and hidden. |
+| Charts | Requests and failures per second, p(50), p(95) and p(99), VUs, highest agent CPU. Tooltips at the cursor, legend entries hide a line, dragging zooms and a double-click resets. |
+| Failures | Failed requests grouped by method, name, status and error. |
+| Errors | Identical error messages from the script, such as exceptions with their stack, with counts and agents. |
+| Thresholds | Thresholds and checks on the merged data, so far during a run. |
+| Agents | State, segment, VUs, iterations, requests, CPU, memory of k6, sample lag. |
+| Logs | Output of `console.log`, k6 and the controller, with filters by level, source and text. |
+| Downloads | HTML report, JSON summary, CSV of requests, failures, errors and the timeline, logs. |
 
-A bare `:port` binds to localhost. On a loopback address, control needs no token, and the server rejects requests with a foreign `Host` header and control requests without the `X-K6-Fleet` header, so a website open in your browser cannot start a test. On any other address, such as `0.0.0.0:8089`, Start and Stop need a token, because the page can start load against every target in the script. Set it with `K6FLEET_WEB_TOKEN`, or k6-fleet generates one and prints it. The page and `/api/state` can be read without a token, and the server speaks plain HTTP, so on an untrusted network use an ssh tunnel or a TLS proxy in front of it.
+**Start.** The form takes VUs, a duration and variables for `__ENV`. Leaving VUs empty runs the scenarios in the script; a duration then works like `k6 run --duration`. Nothing runs on the agents before Start: k6-fleet connects them and runs `setup()` after you press it.
+
+**Changing VUs during a run.** k6 can only do this with its `externally-controlled` executor. If you enter VUs in the form, k6-fleet replaces the scenarios of the test with that executor in the archive and calls the `default` function, so Edit can raise or lower VUs for the whole fleet. Each k6 applies its own segment. With an empty duration that test runs until Stop. Tests that run the script's own scenarios cannot be changed.
+
+**Stop** ends a running test like an interrupt: `teardown()` still runs, the summary is written, and the exit code is 105. Before the test has started, it removes the k6 instances without running anything. **Reset stats** clears Statistics and Failures, as in Locust. Thresholds, checks and the summary keep all samples.
+
+`--autostart` runs one test at once, as the command line says, and exits when it ends. The page then only watches.
+
+**Access.** A bare `:port` binds to localhost. On a loopback address, control needs no token, and the server rejects requests with a foreign `Host` header and control requests without the `X-K6-Fleet` header, so a website open in your browser cannot start a test. On any other address, such as `0.0.0.0:8089`, control needs a token, because the page can start load against every target in the script. Set it with `K6FLEET_WEB_TOKEN`, or k6-fleet generates one and prints it. The page, `/api/state`, `/api/logs` and the downloads can be read without a token, and the server speaks plain HTTP, so on an untrusted network use an ssh tunnel or a TLS proxy in front of it.
 
 The page uses a small API, which also works from a script:
 
 ```
 curl -s localhost:8089/api/state
-curl -X POST -H 'X-K6-Fleet: 1' localhost:8089/api/start
+curl -X POST -H 'X-K6-Fleet: 1' -d '{"vus":50,"duration":"5m","env":{"BASE":"https://staging.example.com"}}' localhost:8089/api/start
+curl -X POST -H 'X-K6-Fleet: 1' -d '{"vus":80}' localhost:8089/api/vus
 curl -X POST -H 'X-K6-Fleet: 1' -H "Authorization: Bearer $K6FLEET_WEB_TOKEN" http://lg0:8089/api/stop
 ```
 
@@ -163,9 +181,9 @@ Output from CI, real k6 v2.3.0, three agents, `e2e/scripts/shared.js`. The scrip
 - Exit 99 on a crossed threshold, as with plain k6, `abortOnFail` stopping all agents, and `exec.test.abort()` on one instance ending the run with 108.
 - Relative imports, `open()`, and CLI options after `--` reach the agents.
 - `kill -9` on an agent ends the run with exit 3 and removes its k6.
-- With `--web`, no request reaches the target before Start, requests arrive after it and end after Stop, `teardown()` runs once, and the exit code is 105.
+- From the page: no request reaches the target before Start, per-request rows, failures, script exceptions and `console.log` output appear, VUs follow the form and Edit, requests end after Stop, `teardown()` runs once, and a second test runs in the same process.
 
-`go test ./internal/controller/` also covers the page's API against the stub: start, stop in each phase, a failed start, token handling and rejected cross-site requests. The page's own JavaScript has no automated test. It was driven once by hand in headless Chromium against the stub, including Start and Stop.
+`go test ./internal/controller/` covers the page's API against the stub: form validation, every action in each phase, downloads, token handling and rejected cross-site requests. `e2e/ui/ui.mjs` drives the page itself in headless Chrome over the DevTools protocol against real k6 in CI: the form, every tab, sorting, hiding columns, tooltip, legend, zoom, log filters, downloads, Edit, Reset, Stop and New test. It also fails on script errors or CSP violations in the browser.
 
 ## Limits
 
@@ -176,7 +194,10 @@ Output from CI, real k6 v2.3.0, three agents, `e2e/scripts/shared.js`. The scrip
 - Percentiles have a relative error of at most 0.5 percent, so a threshold within that distance of its limit can go either way. Counts, rates, min, max and avg are exact.
 - A custom Gauge has no meaningful sum, so the newest sample across agents counts, compared by agent clocks. `vus` and `vus_max` are summed.
 - Agents were only tested on Linux. The macOS build compiles in CI and has not been run; without Linux's parent-death signal, k6 can outlive a killed agent there.
-- The web page cannot change the script, the agents or the load, and it starts one run per process, unlike Locust's page.
+- Compared with Locust's page: there is no average response size, because k6 reports no body size per request; no picker for user classes; no charts across several tests, because a new test clears the page; and no login, only the control token. Agents connect when a test starts, so an unreachable host shows up then.
+- Per-request statistics need the tags of every `http_req_duration` sample, which leaves the fast parsing path for that metric, and they make frames larger. They are on with `--web` only and have not been benchmarked. Each agent tracks 500 method and name pairs, and further ones count as `(other names)`, so use `tags: { name: ... }` for URLs with IDs.
+- The Errors tab counts the first 200 lines of k6 output per agent, so an error logged on every iteration stops counting there. The Logs tab keeps 2000 lines.
+- In a test started with VUs from the form, the `default` function runs and scenarios in the script are ignored. A script without a `default` export fails at the start.
 - Environment variables such as `K6_*` are not forwarded to agents. Use `-e` and options after `--`, which end up in the archive.
 - The start is synchronised to the measured clock offset. Its precision depends on the round trip of the control connection.
 

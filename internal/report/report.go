@@ -67,9 +67,93 @@ type Point struct {
 	VUs    float64 `json:"vus"`
 	Reqs   float64 `json:"reqs"`
 	Iters  float64 `json:"iterations"`
+	P50    float64 `json:"p50_ms"`
 	P95    float64 `json:"p95_ms"`
+	P99    float64 `json:"p99_ms"`
+	Fails  float64 `json:"fails"`
 	Failed float64 `json:"failed_rate"`
 	CPUMax float64 `json:"cpu_max"`
+}
+
+// RequestRow is the statistics of one method and name.
+type RequestRow struct {
+	Method      string  `json:"method"`
+	Name        string  `json:"name"`
+	Requests    uint64  `json:"requests"`
+	Fails       uint64  `json:"fails"`
+	Avg         float64 `json:"avg_ms"`
+	Min         float64 `json:"min_ms"`
+	Med         float64 `json:"med_ms"`
+	P90         float64 `json:"p90_ms"`
+	P95         float64 `json:"p95_ms"`
+	P99         float64 `json:"p99_ms"`
+	Max         float64 `json:"max_ms"`
+	RPS         float64 `json:"rps"`
+	FailsPerSec float64 `json:"fails_per_s"`
+}
+
+// FailureRow counts one kind of failed request.
+type FailureRow struct {
+	Method string `json:"method"`
+	Name   string `json:"name"`
+	Status string `json:"status"`
+	Error  string `json:"error"`
+	Count  uint64 `json:"count"`
+}
+
+// Total is the name of the row that sums all others.
+const Total = "Aggregated"
+
+func requestRow(method, name string, k *sketch.Sketch, fails uint64, rps, fps float64) RequestRow {
+	return RequestRow{
+		Method: method, Name: name, Requests: uint64(k.Count), Fails: fails, Avg: k.Avg(), Min: k.Min, Max: k.Max,
+		Med: k.Quantile(0.5), P90: k.Quantile(0.9), P95: k.Quantile(0.95), P99: k.Quantile(0.99),
+		RPS: rps, FailsPerSec: fps,
+	}
+}
+
+// Requests lists the statistics per request, sorted, with a total as last row.
+// rate gives the current requests and failures per second of a key.
+func Requests(f *agg.Fleet, rate func(key string) (float64, float64)) []RequestRow {
+	if len(f.Requests) == 0 {
+		return nil
+	}
+	out := make([]RequestRow, 0, len(f.Requests)+1)
+	total := sketch.New()
+	var fails uint64
+	var rps, fps float64
+	for k, s := range f.Requests {
+		method, name, _ := strings.Cut(k, "\x1f")
+		r, e := rate(k)
+		out = append(out, requestRow(method, name, s.Sketch, s.NonZero, r, e))
+		total.Merge(s.Sketch)
+		fails += s.NonZero
+		rps += r
+		fps += e
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Name != out[j].Name {
+			return out[i].Name < out[j].Name
+		}
+		return out[i].Method < out[j].Method
+	})
+	return append(out, requestRow("", Total, total, fails, rps, fps))
+}
+
+// Failures lists the kinds of failed requests, the most frequent first.
+func Failures(f *agg.Fleet) []FailureRow {
+	out := make([]FailureRow, 0, len(f.Failures))
+	for k, n := range f.Failures {
+		p := strings.SplitN(k, "\x1f", 4)
+		out = append(out, FailureRow{Method: p[0], Name: p[1], Status: p[2], Error: p[3], Count: n})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Count != out[j].Count {
+			return out[i].Count > out[j].Count
+		}
+		return out[i].Name+out[i].Status < out[j].Name+out[j].Status
+	})
+	return out
 }
 
 // Data is the whole summary.
@@ -85,7 +169,10 @@ type Data struct {
 	Checks     []CheckResult     `json:"checks"`
 	Agents     []AgentResult     `json:"agents"`
 	Timeline   []Point           `json:"timeline"`
-	Warnings   []string          `json:"warnings,omitempty"`
+	// Requests and Failures exist with --web. The last Requests row is the total.
+	Requests []RequestRow `json:"requests,omitempty"`
+	Failures []FailureRow `json:"failures,omitempty"`
+	Warnings []string     `json:"warnings,omitempty"`
 	// PercentileRelativeError bounds the percentile values. Everything else is
 	// exact.
 	PercentileRelativeError float64 `json:"percentile_relative_error"`

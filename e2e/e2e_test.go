@@ -461,100 +461,83 @@ func TestKilledAgentAbortsAndTakesK6Along(t *testing.T) {
 	}
 }
 
-func webState(t *testing.T, port string) map[string]any {
+type webAPI struct {
+	Phase    string  `json:"phase"`
+	Run      int     `json:"run"`
+	VUs      float64 `json:"vus"`
+	ExitCode *int    `json:"exit_code"`
+	Requests []struct {
+		Name     string `json:"name"`
+		Requests uint64 `json:"requests"`
+		Fails    uint64 `json:"fails"`
+	} `json:"requests"`
+	Failures []struct {
+		Name   string `json:"name"`
+		Status string `json:"status"`
+	} `json:"failures"`
+	Errors []struct {
+		Message string `json:"message"`
+	} `json:"errors"`
+	Timeline []struct {
+		VUs float64 `json:"vus"`
+	} `json:"timeline"`
+}
+
+func webState(t *testing.T, port string) (s webAPI) {
 	t.Helper()
 	resp, err := http.Get("http://127.0.0.1:" + port + "/api/state")
 	if err != nil {
-		return nil
+		return s
 	}
 	defer resp.Body.Close()
-	var s map[string]any
-	if resp.StatusCode == http.StatusOK {
-		if err := json.NewDecoder(resp.Body).Decode(&s); err != nil {
-			t.Errorf("state: %v", err)
-		}
+	if err := json.NewDecoder(resp.Body).Decode(&s); err != nil {
+		t.Errorf("state: %v", err)
 	}
 	return s
 }
 
-func webWait(t *testing.T, port, phase string, out *bytes.Buffer) map[string]any {
+func webUntil(t *testing.T, port, what string, out *bytes.Buffer, ok func(webAPI) bool) webAPI {
 	t.Helper()
 	for deadline := time.Now().Add(60 * time.Second); time.Now().Before(deadline); time.Sleep(100 * time.Millisecond) {
-		if s := webState(t, port); s != nil && s["phase"] == phase {
+		if s := webState(t, port); ok(s) {
 			return s
 		}
 	}
-	t.Fatalf("phase %s not reached\n%s", phase, out.String())
-	return nil
+	t.Fatalf("%s not reached: %+v\n%s", what, webState(t, port), out.String())
+	return webAPI{}
 }
 
-func webPost(t *testing.T, port, action string) {
+func webPost(t *testing.T, port, action, body string) {
 	t.Helper()
-	req, _ := http.NewRequest(http.MethodPost, "http://127.0.0.1:"+port+"/api/"+action, nil)
+	req, _ := http.NewRequest(http.MethodPost, "http://127.0.0.1:"+port+"/api/"+action, strings.NewReader(body))
 	req.Header.Set("X-K6-Fleet", "1")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
-	resp.Body.Close()
+	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusAccepted {
-		t.Fatalf("%s: %d", action, resp.StatusCode)
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("%s: %d %s", action, resp.StatusCode, b)
 	}
 }
 
-// Start and Stop from the page, checked at the target: nothing arrives before
-// Start, requests arrive afterwards, and they end with Stop.
-func TestWebStartAndStop(t *testing.T) {
-	tg := newTarget(t)
+func startWeb(t *testing.T, port string) (*exec.Cmd, *bytes.Buffer) {
+	t.Helper()
 	dir := t.TempDir()
-	sum := filepath.Join(dir, "s.json")
-	port := freePort(t)
-	cmd := exec.Command(fleetBin, "run", "--local", "2", "--web", "127.0.0.1:"+port, "--summary-export", sum, "scripts/web.js", "--", "-e", "BASE="+tg.url)
+	cmd := exec.Command(fleetBin, "run", "--local", "2", "--web", "127.0.0.1:"+port, "--summary-export", filepath.Join(dir, "s.json"), "scripts/web.js")
 	var out bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &out
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
-	defer cmd.Process.Kill()
-	counts := func() (int, int, int) {
-		tg.mu.Lock()
-		defer tg.mu.Unlock()
-		return tg.setups, tg.requests, tg.teardown
-	}
+	t.Cleanup(func() { _ = cmd.Process.Kill() })
+	webUntil(t, port, "the page", &out, func(s webAPI) bool { return s.Phase == "idle" })
+	return cmd, &out
+}
 
-	webWait(t, port, "ready", &out)
-	time.Sleep(2 * time.Second)
-	if setups, requests, _ := counts(); setups != 0 || requests != 0 {
-		t.Fatalf("before Start: %d setups, %d requests", setups, requests)
-	}
-
-	webPost(t, port, "start")
-	webWait(t, port, "running", &out)
-	time.Sleep(5 * time.Second)
-	live := webState(t, port)
-	if setups, requests, _ := counts(); setups != 1 || requests == 0 {
-		t.Fatalf("after Start: %d setups, %d requests", setups, requests)
-	}
-	points, _ := live["timeline"].([]any)
-	agents, _ := live["agents"].([]any)
-	if len(points) < 2 || len(agents) != 2 {
-		t.Errorf("live state: %d points, %d agents", len(points), len(agents))
-	}
-
-	webPost(t, port, "stop")
-	end := webWait(t, port, "finished", &out)
-	_, stopped, teardowns := counts()
-	time.Sleep(2 * time.Second)
-	if _, later, _ := counts(); later != stopped {
-		t.Errorf("requests went on after the run ended: %d then %d", stopped, later)
-	}
-	if teardowns != 1 {
-		t.Errorf("teardown ran %d times", teardowns)
-	}
-	if end["exit_code"] != float64(105) {
-		t.Errorf("state after Stop: %v", end)
-	}
-
+func stopWeb(t *testing.T, cmd *exec.Cmd, out *bytes.Buffer) int {
+	t.Helper()
 	if err := cmd.Process.Signal(os.Interrupt); err != nil {
 		t.Fatal(err)
 	}
@@ -565,20 +548,102 @@ func TestWebStartAndStop(t *testing.T) {
 	case <-time.After(20 * time.Second):
 		t.Fatalf("page did not close on interrupt:\n%s", out.String())
 	}
-	if c := cmd.ProcessState.ExitCode(); c != 105 {
-		t.Errorf("exit %d\n%s", c, out.String())
+	return cmd.ProcessState.ExitCode()
+}
+
+// Everything the page does, checked at the target where possible: nothing
+// arrives before Start, VUs follow the form and the edit, requests end with
+// Stop, and a second test runs in the same process.
+func TestWebControlsRealK6(t *testing.T) {
+	tg := newTarget(t)
+	port := freePort(t)
+	cmd, out := startWeb(t, port)
+	counts := func() (int, int, int) {
+		tg.mu.Lock()
+		defer tg.mu.Unlock()
+		return tg.setups, tg.requests, tg.teardown
 	}
-	var s summary
-	b, err := os.ReadFile(sum)
+	time.Sleep(2 * time.Second)
+	if setups, requests, _ := counts(); setups != 0 || requests != 0 {
+		t.Fatalf("before Start: %d setups, %d requests", setups, requests)
+	}
+
+	webPost(t, port, "start", fmt.Sprintf(`{"vus":4,"env":{"BASE":%q,"FAIL":"1"}}`, tg.url))
+	vus := func(n float64) func(webAPI) bool { return func(s webAPI) bool { return s.Phase == "running" && s.VUs == n } }
+	webUntil(t, port, "4 VUs", out, vus(4))
+	s := webUntil(t, port, "request rows", out, func(s webAPI) bool { return len(s.Requests) == 3 && len(s.Failures) > 0 && len(s.Errors) > 0 })
+	rows := map[string]uint64{}
+	for _, r := range s.Requests {
+		rows[r.Name] = r.Fails
+	}
+	if _, ok := rows["hit"]; !ok || rows["hit"] != 0 || rows["broken"] == 0 {
+		t.Errorf("rows: %+v", s.Requests)
+	}
+	if s.Failures[0].Name != "broken" || s.Failures[0].Status != "500" {
+		t.Errorf("failures: %+v", s.Failures)
+	}
+	if !strings.Contains(s.Errors[0].Message, "deliberate failure") {
+		t.Errorf("errors: %+v", s.Errors)
+	}
+	resp, err := http.Get("http://127.0.0.1:" + port + "/api/logs")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := json.Unmarshal(b, &s); err != nil {
-		t.Fatal(err)
+	logs, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if !strings.Contains(string(logs), "first iteration done") {
+		t.Errorf("logs: %s", logs)
 	}
-	if got := s.Metrics["http_reqs"].Values["count"]; got == 0 || got > float64(stopped)+5 {
-		t.Errorf("summary counts %v requests, the target saw %d", got, stopped)
+
+	webPost(t, port, "vus", `{"vus":9}`)
+	webUntil(t, port, "9 VUs", out, vus(9))
+	webPost(t, port, "vus", `{"vus":3}`)
+	webUntil(t, port, "3 VUs", out, vus(3))
+
+	webPost(t, port, "stop", ``)
+	end := webUntil(t, port, "the end of run 1", out, func(s webAPI) bool { return s.Phase == "finished" })
+	_, stopped, teardowns := counts()
+	time.Sleep(2 * time.Second)
+	if _, later, _ := counts(); later != stopped {
+		t.Errorf("requests went on after the run ended: %d then %d", stopped, later)
 	}
+	if teardowns != 1 {
+		t.Errorf("teardown ran %d times", teardowns)
+	}
+	if end.ExitCode == nil || *end.ExitCode != 105 {
+		t.Errorf("state after Stop: %+v", end)
+	}
+
+	webPost(t, port, "start", fmt.Sprintf(`{"duration":"3s","env":{"BASE":%q}}`, tg.url))
+	second := webUntil(t, port, "the end of run 2", out, func(s webAPI) bool { return s.Run == 2 && s.Phase == "finished" })
+	if second.ExitCode == nil || *second.ExitCode != 0 || len(second.Requests) != 2 || second.Requests[0].Fails != 0 {
+		t.Errorf("second run: %+v", second)
+	}
+	if setups, _, teardowns := counts(); setups != 2 || teardowns != 2 {
+		t.Errorf("%d setups, %d teardowns over two runs", setups, teardowns)
+	}
+	if c := stopWeb(t, cmd, out); c != 0 {
+		t.Errorf("exit %d, want that of the last run\n%s", c, out.String())
+	}
+}
+
+// Drives the page itself in Chrome against real k6.
+func TestWebPageInBrowser(t *testing.T) {
+	chrome := os.Getenv("K6FLEET_E2E_CHROME")
+	if chrome == "" {
+		t.Skip("set K6FLEET_E2E_CHROME to the Chrome binary")
+	}
+	tg := newTarget(t)
+	port := freePort(t)
+	cmd, out := startWeb(t, port)
+	ui := exec.Command("node", "ui/ui.mjs", "http://127.0.0.1:"+port+"/", chrome, tg.url)
+	ui.Env = append(os.Environ(), "UI_SHOTS="+os.Getenv("K6FLEET_E2E_SHOTS"))
+	b, err := ui.CombinedOutput()
+	t.Log(string(b))
+	if err != nil {
+		t.Errorf("browser test: %v\n%s", err, out.String())
+	}
+	stopWeb(t, cmd, out)
 }
 
 // Logs what the sample pipeline costs and where. There is no assertion, because
