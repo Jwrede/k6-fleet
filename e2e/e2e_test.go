@@ -569,7 +569,9 @@ func TestWebControlsRealK6(t *testing.T) {
 	}
 
 	webPost(t, port, "start", fmt.Sprintf(`{"vus":4,"env":{"BASE":%q,"FAIL":"1"}}`, tg.url))
-	vus := func(n float64) func(webAPI) bool { return func(s webAPI) bool { return s.Phase == "running" && s.VUs == n } }
+	vus := func(n float64) func(webAPI) bool {
+		return func(s webAPI) bool { return s.Phase == "running" && s.VUs == n }
+	}
 	webUntil(t, port, "4 VUs", out, vus(4))
 	s := webUntil(t, port, "request rows", out, func(s webAPI) bool { return len(s.Requests) == 3 && len(s.Failures) > 0 && len(s.Errors) > 0 })
 	rows := map[string]uint64{}
