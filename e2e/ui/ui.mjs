@@ -156,7 +156,7 @@ try {
   await ev(`document.getElementById('new').click()`);
   ok(await ev(`document.getElementById('f-vus').value === '4' && document.querySelectorAll('.envrow').length === 2`), 'form remembers the last values');
   await ev(`document.getElementById('f-duration').value = '3s'; document.getElementById('f-start').click()`);
-  await until(`${text('#m-time')}.includes('of 3s')`, 'second run starts from the page');
+  await until(`state.run === 2 && state.phase !== 'finished'`, 'second run starts from the page');
   await until(`${text('#m-status')}.startsWith('finished (exit')`, 'second run ends by its duration');
 
   ok(problems.length === 0, `no script errors or CSP violations in the browser${problems.length ? ': ' + problems.join(' | ') : ''}`);
