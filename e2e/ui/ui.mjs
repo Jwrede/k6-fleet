@@ -130,6 +130,8 @@ try {
   ok(files.length === 7 && files.every((c) => c === 200), `downloads answer (${files})`);
 
   await tab('stats');
+  await sleep(300);
+  await shot('stats');
   if (live) {
     await ev(`document.getElementById('edit').click()`);
     ok(await ev(`document.getElementById('e-vus').value === '4'`), 'edit form shows the current VUs');

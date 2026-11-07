@@ -102,6 +102,12 @@ k6-fleet run --ssh lg1,lg2,lg3 --web :8089 checkout.js
 
 The controller then serves a page at `http://127.0.0.1:8089/`, in the spirit of Locust's web UI and embedded in the binary without external assets. The idea came from [a comment in grafana/k6 #140](https://github.com/grafana/k6/issues/140#issuecomment-6679444658). The process stays up and runs one test after another until you press Ctrl-C, then exits with the code of the last test.
 
+![Statistics tab during a run](docs/web-statistics.png)
+
+![Charts tab with a tooltip](docs/web-charts.png)
+
+Both screenshots come from the CI run against real k6 v1.8.2 with two agents. Half of the requests fail on purpose, because the test script calls an endpoint that answers 500.
+
 | Tab | Content |
 |---|---|
 | Statistics | One row per method and request name, with a total: requests, fails, median, p(90), p(95), p(99), average, min, max, current RPS and failures/s, share. Columns can be sorted and hidden. |

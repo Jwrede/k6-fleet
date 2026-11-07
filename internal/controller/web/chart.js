@@ -2,7 +2,7 @@
 // A small line chart in SVG: axes, tooltip, legend toggles, drag to zoom. The
 // page has to work without external assets, so no chart library is used.
 const SVG = "http://www.w3.org/2000/svg";
-const PAD = {l: 58, r: 10, t: 8, b: 20};
+const PAD = {l: 58, r: 22, t: 8, b: 20};
 
 function svgEl(name, attrs, cls) {
   const e = document.createElementNS(SVG, name);
